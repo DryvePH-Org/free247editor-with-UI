@@ -9,31 +9,43 @@ future edit, so it learns your style.
 
 ## Setup (once)
 
+This repo is private. You need a GitHub account that has been invited to it; ask your team
+lead. Sign in to GitHub when the download asks you to.
+
 ### One prompt
 
 Open Claude Code in any folder (terminal: `claude`, or the Code tab in the Claude desktop app)
 and paste:
 
 ```text
-Set up free247editor for me. Clone https://github.com/riecodes/free247editor.git into my
-Documents folder (install Git first if it is missing, after asking me). Then follow the
-"start" steps in its CLAUDE.md: run node setup.mjs from that folder, install anything it
-reports missing after asking me, help me choose free transcription (a Groq key I paste into
-.env myself, or local faster-whisper), open the test video, and walk me through style setup.
-When you finish, tell me the full path of the inbox folder and remind me to open Claude in
-the free247editor folder from now on.
+Set up free247editor for me. Clone https://github.com/DryvePH-Org/free247editor-with-UI.git
+into a folder named free247editor in my Documents folder (install Git first if it is missing,
+after asking me; I may need to sign in to GitHub). Then follow the "start" steps in its
+CLAUDE.md: run node setup.mjs from that folder, install anything it reports missing after
+asking me, help me choose free transcription (a Groq key I paste into .env myself, or local
+faster-whisper), open the test video, and walk me through style setup. If I say I have my
+team's .brandpack file, skip style setup; I will import it in the app. When you finish, tell
+me the full path of the inbox folder and remind me to open Claude in the free247editor folder
+from now on.
 ```
 
 From then on, open Claude in the `free247editor` folder so it reads its `CLAUDE.md`.
 
 ### Step by step
 
-1. **Get it.** `git clone https://github.com/riecodes/free247editor.git`, or use
-   *Code > Download ZIP* on GitHub and unzip it.
+1. **Get it.** `git clone https://github.com/DryvePH-Org/free247editor-with-UI.git free247editor`,
+   or use *Code > Download ZIP* on GitHub, unzip it, and rename the folder to `free247editor`.
 2. **Open the folder in Claude Code.** In a terminal: `cd free247editor` then `claude`.
    Or, in the Claude desktop app, open the Code tab and choose the folder.
 3. **Type `start`.** Claude checks your computer, installs what is missing (with your OK),
    renders a test video, and asks a few questions about your style.
+
+### Joining the team
+
+Your team lead sends you a `.brandpack` file. After setup, double-click **Open Editor**, go to
+**My brand**, and click **Import brand pack**. It sets the team's style, logo, social page
+screenshot, brand contact and B-roll, so your videos match everyone else's, and you can skip
+the style questions. Your own rules and sales people stay yours.
 
 ## The app (easiest)
 
