@@ -279,7 +279,7 @@ function projectCard(p) {
   return `<article class="card">
     <a class="cover" href="#/p/${enc(p.slug)}" aria-label="Open ${esc(p.title)}"><span class="thumb"${thumb ? ` data-preview="${projectMedia(p, 'preview')}"` : ''}>${thumb ? `<img src="${thumb}" alt="" loading="lazy" decoding="async">` : ''}${tape}</span></a>
     <div class="body">
-      <div><div class="name">${esc(p.title)}</div><div class="meta">${p.versions.length ? `${plural(p.versions.length, 'version')} · ` : ''}${ago(p.updatedAt)}</div></div>
+      <div><div class="name" title="${esc(p.title)}">${esc(p.title)}</div><div class="meta">${p.versions.length ? `${plural(p.versions.length, 'version')} · ` : ''}${ago(p.updatedAt)}</div></div>
       <a class="btn sm" href="#/p/${enc(p.slug)}">Open</a>
     </div>${S.job?.slug === p.slug || p.status === 'queued' ? '' : delBtn([{ area: 'project', path: p.slug }], `the video “${p.title}” and all its versions`, { cls: 'card-del' })}</article>`;
 }
