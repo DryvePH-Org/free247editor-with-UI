@@ -36,7 +36,13 @@ const duration = Number(run('ffprobe', ['-v', 'error', '-show_entries', 'format=
 
 let words;
 if (local) {
-  const json = run('python', [join(root, 'tools', 'transcribe_local.py'), resolve(video), model]);
+  // macOS ships python3 only; Windows usually has python. Use whichever has faster-whisper.
+  const py = ['python3', 'python'].find((c) => spawnSync(c, ['-c', 'import faster_whisper'], { stdio: 'ignore', windowsHide: true }).status === 0);
+  if (!py) {
+    console.error('faster-whisper is not installed. Run: pip3 install faster-whisper (or pip install faster-whisper on Windows).');
+    process.exit(5);
+  }
+  const json = run(py, [join(root, 'tools', 'transcribe_local.py'), resolve(video), model]);
   words = JSON.parse(json);
 } else {
   if (!process.env.GROQ_API_KEY) {

@@ -35,7 +35,29 @@ From then on, open Claude in the `free247editor` folder so it reads its `CLAUDE.
 3. **Type `start`.** Claude checks your computer, installs what is missing (with your OK),
    renders a test video, and asks a few questions about your style.
 
-## Editing
+## The app (easiest)
+
+After setup, double-click **Open Editor** in the `free247editor` folder (`Open Editor.command` on Mac,
+`Open Editor.bat` on Windows), or run `node app/server.mjs`. A page opens in your browser where you:
+
+- drop in all the clips for one video (retakes too); the editor puts them in story order
+- keep each video's clips in a folder, and move clips between folders
+- delete any clip, folder, brand file, sound or video, one by one or all at once (they go to the Trash)
+- say who each video is for: all sales (ends with the brand contact) or one sales person
+- watch the progress step by step, and line up more videos while it works
+- play each version (v1, v2, ...) and type notes, with the time where you paused
+- see what the editor could not do yet (for example "no B-roll"), and add it
+- click **Approve and make final**, or make a YouTube (horizontal) version
+- add your logo, brand contact, sales people, social page screenshot, B-roll library, and music in **My brand**
+- share your brand with teammates as one `.brandpack` file, so their videos match yours
+- pick or change your style, and see or edit your rules
+- check setup, let the editor fix what is missing, and save your free Groq key
+
+The app runs only on your computer (it is not reachable from other devices) and uses your Claude plan,
+just like the chat. Keep its window open while you edit. On Mac, if double-clicking is blocked the
+first time, right-click **Open Editor.command** and choose *Open*.
+
+## Editing in the Claude chat
 
 1. Put a raw video in the `inbox` folder, or drag it into the Claude chat.
 2. Say **"edit this"**.
@@ -88,6 +110,8 @@ use. Claude will never call a paid service (ElevenLabs, Kie.ai, or others) witho
 ```
 free247editor/
   CLAUDE.md          how Claude runs your editor
+  Open Editor.*      double-click to open the app
+  app/               the app (a local web page)
   setup.mjs          one-time setup (safe to re-run)
   tools/             free transcription
   inbox/             your raw videos
@@ -95,6 +119,8 @@ free247editor/
   my-style.md        your style (created at setup, stays private)
   my-rules.md        rules learned from your notes (stays private)
   my-sounds/         your music and sound effects
+  my-brand/          logo, social screenshot, B-roll library, brand rules
+  my-people.json     sales people a video can be for (stays private)
   kit/               the editing engine (installed by setup)
 ```
 
@@ -113,6 +139,9 @@ Nate Herk (MIT), built on [HyperFrames](https://github.com/heygen-com/hyperframe
 [GSAP](https://gsap.com/). Setup downloads it from its own repository; it is not copied
 here. The AI Automation Society brand assets inside that kit belong to their owner and are
 not licensed for reuse.
+
+The app uses [Phosphor Icons](https://phosphoricons.com) (MIT) and the fonts Bricolage Grotesque and
+Permanent Marker (SIL Open Font License), stored in `app/public` so it works offline.
 
 free247editor is not affiliated with Anthropic, Nate Herk, or HeyGen.
 

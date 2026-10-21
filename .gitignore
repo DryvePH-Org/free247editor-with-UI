@@ -7,11 +7,18 @@ node_modules/
 inbox/*
 outbox/*
 my-sounds/*
+my-brand/
+my-people.json
+my-style.md.bak-*
+*.brandpack
 !inbox/.gitkeep
 !outbox/.gitkeep
 !my-sounds/.gitkeep
 my-style.md
 my-rules.md
+my-style.md.bak
+my-rules.md.bak
+.webapp/
 *.transcribe.mp3
 
 # Sync tools

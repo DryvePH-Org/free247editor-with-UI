@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>free247editor</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="preload" href="/fonts/bricolage-grotesque-latin-opsz-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <div class="shell">
+    <nav class="side" aria-label="Main">
+      <a class="brand" href="#/">
+        <svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="7" width="26" height="20" rx="3" fill="var(--inverse)"/><path d="M3 12h26" stroke="var(--tape)" stroke-width="3"/><path d="M8 7l3 5M15 7l3 5M22 7l3 5" stroke="var(--on-inverse)" stroke-width="2"/><path d="M14 16.5v6l5-3z" fill="var(--on-inverse)"/></svg>
+        <span>free247<b>editor</b></span>
+      </a>
+      <a class="nav" href="#/" data-nav="studio"><i data-icon="television-simple"></i><span>Studio</span></a>
+      <a class="nav" href="#/videos" data-nav="videos"><i data-icon="squares-four"></i><span>My videos</span></a>
+      <a class="nav" href="#/brand" data-nav="brand"><i data-icon="storefront"></i><span>My brand</span></a>
+      <a class="nav" href="#/style" data-nav="style"><i data-icon="pencil-simple"></i><span>My style</span></a>
+      <a class="nav" href="#/rules" data-nav="rules"><i data-icon="list-checks"></i><span>My rules</span></a>
+      <a class="nav" href="#/setup" data-nav="setup"><i data-icon="gear-six"></i><span>Setup</span><i class="flag" data-setup-flag hidden><span class="sr">Needs attention</span></i></a>
+      <div class="side-status" data-region-global="sideStatus"></div>
+    </nav>
+    <main id="main" tabindex="-1"></main>
+  </div>
+
+  <div class="drop-overlay" hidden><div><i data-icon="upload-simple"></i><p>Drop to add to your inbox</p></div></div>
+  <div class="uploads" aria-live="polite"></div>
+  <div class="toasts" role="status" aria-live="polite"></div>
+  <dialog class="modal" id="modal" aria-labelledby="modal-title"></dialog>
+  <dialog class="modal small" id="confirm" aria-labelledby="confirm-title"></dialog>
+  <input type="file" id="picker" accept="video/*,.mov,.mp4,.m4v,image/*,.txt" multiple hidden>
+  <input type="file" id="sound-picker" accept="audio/*,.mp3,.wav,.m4a" multiple hidden>
+  <input type="file" id="brand-picker" hidden>
+  <input type="file" id="pack-picker" accept=".brandpack" hidden>
+
+  <script src="/icons.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

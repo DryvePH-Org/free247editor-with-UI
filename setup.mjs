@@ -79,7 +79,8 @@ step('Transcription');
 if (!existsSync(join(root, '.env'))) copyFileSync(join(root, '.env.example'), join(root, '.env'));
 try { process.loadEnvFile(join(root, '.env')); } catch {}
 const groq = Boolean(process.env.GROQ_API_KEY);
-const localWhisper = Boolean(run('python', ['-c', 'import faster_whisper'], root, true));
+// macOS ships python3 only; Windows usually has python.
+const localWhisper = ['python3', 'python'].some((py) => run(py, ['-c', 'import faster_whisper'], root, true));
 console.log(`Groq key in .env: ${groq ? 'yes' : 'no'}`);
 console.log(`Local faster-whisper: ${localWhisper ? 'yes' : 'no'}`);
 
