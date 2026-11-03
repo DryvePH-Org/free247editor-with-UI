@@ -1,0 +1,8 @@
+{
+  "name": "free247editor",
+  "private": true,
+  "description": "Tools beside the kit: free local voiceover (tools/voiceover.mjs). Installed by setup.mjs.",
+  "dependencies": {
+    "kokoro-js": "1.2.0"
+  }
+}

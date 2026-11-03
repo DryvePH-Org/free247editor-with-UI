@@ -9,6 +9,7 @@ outbox/*
 my-sounds/*
 my-brand/
 my-people.json
+my-styles/
 my-style.md.bak-*
 *.brandpack
 !inbox/.gitkeep

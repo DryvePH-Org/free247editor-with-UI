@@ -4,7 +4,8 @@
 //
 //   node setup.mjs
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, existsSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -83,6 +84,14 @@ const groq = Boolean(process.env.GROQ_API_KEY);
 const localWhisper = ['python3', 'python'].some((py) => run(py, ['-c', 'import faster_whisper'], root, true));
 console.log(`Groq key in .env: ${groq ? 'yes' : 'no'}`);
 console.log(`Local faster-whisper: ${localWhisper ? 'yes' : 'no'}`);
+
+step('Voiceover');
+// Free local voiceover (Kokoro, no Python), so the editor can voice a line when a video has no recording.
+// npm install, not npm ci: ci wipes node_modules, and with it the voice model the test line downloads (about 90 MB).
+const voiceTest = join(tmpdir(), 'free247editor-voice-test.wav');
+const tts = run('npm', ['install', '--no-audit', '--no-fund'], root, true) && run('node', ['tools/voiceover.mjs', 'Your editor is ready.', voiceTest], root, true);
+rmSync(voiceTest, { force: true });
+console.log(`Local voiceover: ${tts ? 'yes' : 'no (run npm install in this folder, then node setup.mjs again)'}`);
 
 console.log(`\nSETUP COMPLETE${groq || localWhisper ? '' : ' (transcription not configured yet)'}`);
 console.log(`Drop raw videos in ${resolve(root, 'inbox')} or drag one into Claude and say "edit this".`);

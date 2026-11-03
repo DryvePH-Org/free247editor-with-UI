@@ -44,7 +44,7 @@ From then on, open Claude in the `free247editor` folder so it reads its `CLAUDE.
 
 Your team lead sends you a `.brandpack` file. After setup, double-click **Open Editor**, go to
 **My brand**, and click **Import brand pack**. It sets the team's style, logo, social page
-screenshot, brand contact and B-roll, so your videos match everyone else's, and you can skip
+screenshot, brand contact, B-roll, pictures and learned styles, so your videos match everyone else's, and you can skip
 the style questions. Your own rules and sales people stay yours.
 
 ## The app (easiest)
@@ -129,6 +129,7 @@ free247editor/
   inbox/             your raw videos
   outbox/            drafts and finals
   my-style.md        your style (created at setup, stays private)
+  my-styles/         extra named styles learned from sample videos, with storyboard frames
   my-rules.md        rules learned from your notes (stays private)
   my-sounds/         your music and sound effects
   my-brand/          logo, social screenshot, B-roll library, brand rules

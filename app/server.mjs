@@ -11,21 +11,26 @@ import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { once } from 'node:events';
 import {
-  closeSync, copyFileSync, createReadStream, lstatSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync,
+  closeSync, copyFileSync, cpSync, createReadStream, lstatSync, createWriteStream, existsSync, mkdirSync, openSync, readdirSync,
   readFileSync, readSync, renameSync, rmSync, statSync, watch, writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
 import { homedir } from 'node:os';
-import { basename, delimiter, dirname, extname, join, resolve } from 'node:path';
+import { basename, delimiter, dirname, extname, join, relative, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pub = join(root, 'app', 'public');
 // my-brand/ holds what every video for the brand uses: logo.*, social.* (a screenshot of the social
-// page), broll/broll_<category>_<nn>.*, brand-rules.md and pack.json (present = style comes from a brand pack).
-const dirs = { inbox: join(root, 'inbox'), outbox: join(root, 'outbox'), sounds: join(root, 'my-sounds'), brand: join(root, 'my-brand') };
+// page), broll/broll_<category>_<nn>.*, images/ (reusable brand pictures), brand.json (colors, gradients,
+// font moods, feel, about the company) with fonts/ (the font shelf), brand-rules.md and pack.json
+// (present = style comes from a brand pack).
+// my-styles/ holds extra named styles learned from sample videos, one folder each (see listStyles).
+const dirs = { inbox: join(root, 'inbox'), outbox: join(root, 'outbox'), sounds: join(root, 'my-sounds'), brand: join(root, 'my-brand'), styles: join(root, 'my-styles') };
 const brollDir = join(dirs.brand, 'broll');
+const imagesDir = join(dirs.brand, 'images');
+const fontsDir = join(dirs.brand, 'fonts');
 // Sales people a video can be for (personal, optional in a brand pack), and the brand contact for all-sales videos.
 const peopleFile = join(root, 'my-people.json');
 const brandContactFile = join(dirs.brand, 'contact.json');
@@ -33,7 +38,7 @@ const data = join(root, '.webapp');
 const projectsDir = join(data, 'projects');
 const thumbsDir = join(data, 'thumbs');
 const previewsDir = join(data, 'previews');
-for (const d of [...Object.values(dirs), brollDir, projectsDir, thumbsDir, previewsDir]) mkdirSync(d, { recursive: true });
+for (const d of [...Object.values(dirs), brollDir, imagesDir, fontsDir, projectsDir, thumbsDir, previewsDir]) mkdirSync(d, { recursive: true });
 
 const win = process.platform === 'win32';
 // Double-click launchers start without the user's shell profile, so add the usual install places.
@@ -48,6 +53,7 @@ const MIME = {
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
   '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
   '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.txt': 'text/plain; charset=utf-8',
+  '.ttf': 'font/ttf', '.otf': 'font/otf', '.woff': 'font/woff', '.woff2': 'font/woff2',
 };
 const PERMISSION_MODES = ['auto', 'bypassPermissions'];
 const MODELS = ['', 'opus', 'sonnet', 'fable'];
@@ -67,7 +73,9 @@ const safeName = (name) => {
 const slugify = (s) => s.toLowerCase().replace(/\.[^.]+$/, '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'video';
 
 const settingsFile = join(data, 'settings.json');
-const getSettings = () => ({ permissionMode: 'auto', model: '', ...readJson(settingsFile, {}) });
+// mainStyleName is the name the person gave my-style.md in the app ('' = "My style", or the brand pack's name).
+// brandCheck: before each draft is saved, the editor checks it against My brand (off unless turned on).
+const getSettings = () => ({ permissionMode: 'auto', model: '', mainStyleName: '', brandCheck: false, ...readJson(settingsFile, {}) });
 
 function envHasGroq() {
   const env = readText(join(root, '.env')) || '';
@@ -180,10 +188,19 @@ function listFolder(area) {
   }
   return out.sort((a, b) => b.mtime - a.mtime);
 }
+// my-sounds/sfx/ holds sound effects named <kind>-<n> (whoosh-1.wav). Any other sound under 15 seconds is an
+// effect too (added with the app's button, it lands outside sfx/); everything longer is music.
+const SFX_FOLDER = 'sfx';
+const SFX_MAX_SECONDS = 15;
+const isEffect = (f) => f.folder === SFX_FOLDER || (f.kind === 'audio' &&
+  (probe(join(dirs.sounds, ...(f.folder ? [f.folder] : []), f.name), f.mtime).duration || Infinity) < SFX_MAX_SECONDS);
+const musicFiles = () => listFolder('sounds').filter((f) => f.kind === 'audio' && !isEffect(f));
 const IMAGE = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg']);
+const FONT = new Set(['.ttf', '.otf', '.woff', '.woff2']);
 function kindOf(name) {
   const e = extname(name).toLowerCase();
   if (VIDEO.has(e)) return 'video';
+  if (FONT.has(e)) return 'font';
   if (AUDIO.has(e)) return 'audio';
   if (IMAGE.has(e)) return 'image';
   if (['.txt', '.md'].includes(e)) return 'text';
@@ -235,8 +252,10 @@ const onScreen = (p) => `${p.title ? `${p.title} ` : ''}${p.name}`.trim();
 function cleanPerson(p) {
   const title = TITLES.includes(String(p?.title || '').toUpperCase()) ? String(p.title).toUpperCase() : '';
   const pronoun = ['she', 'he', 'they'].includes(p?.pronoun) ? p.pronoun : /SIR|MR/.test(title) ? 'he' : title ? 'she' : 'they';
-  return { id: /^[a-z0-9-]{6,40}$/.test(p?.id || '') ? p.id : randomUUID().slice(0, 8), title, name: clean(p?.name, 60), pronoun, lines: cleanLines(p?.lines) };
+  return { id: /^[a-z0-9-]{6,40}$/.test(p?.id || '') ? p.id : randomUUID().slice(0, 8), title, name: clean(p?.name, 60), pronoun, lines: cleanLines(p?.lines), fb: clean(p?.fb, 200) };
 }
+// Their own Facebook page shows as one more line in the contact part.
+const contactLines = (p) => [...p.lines, ...(p.fb ? [{ label: 'FACEBOOK', value: p.fb }] : [])];
 function savePerson(p) {
   const person = cleanPerson(p);
   if (!person.name) throw new Error('Give the sales person a name.');
@@ -249,19 +268,45 @@ function savePerson(p) {
 // A CTA.txt like "MISS JHAY\nGLOBE: 0945…" becomes a sales person.
 function personFromText(text) {
   let name = '';
+  let fb = '';
   const lines = [];
   for (const raw of text.split(/\r?\n/)) {
     const l = raw.trim();
     if (!l) continue;
     const m = l.match(/^([^:]{1,30}):\s*(.+)$/);
-    if (m) lines.push({ label: m[1].trim(), value: m[2].trim() });
+    if (m && /^(fb|facebook)( page)?$/i.test(m[1].trim())) fb = m[2].trim();
+    else if (m) lines.push({ label: m[1].trim(), value: m[2].trim() });
     else if (!name) name = l;
   }
   const t = name.match(/^(MISS|MS\.?|MA'?AM|SIR|MR\.?)\s+(.+)$/i);
   const title = t ? ({ MS: 'MS.', MR: 'MR.', MAAM: "MA'AM" }[t[1].toUpperCase().replace(/[.']/g, '')] || t[1].toUpperCase()) : '';
-  return { title, name: t ? t[2] : name, lines };
+  return { title, name: t ? t[2] : name, lines, fb };
 }
 const readBrandContact = () => { const c = readJson(brandContactFile, null); return c && (c.name || c.lines?.length) ? c : null; };
+
+// ---------- brand look: colors, gradients, the font shelf, the feel, and about the company ----------
+// brand.json holds the words; the font files sit in fonts/. fonts maps a file name to its mood ("Big bold").
+const brandLookFile = join(dirs.brand, 'brand.json');
+const HEX_RE = /^#[0-9a-f]{6}$/i;
+const ANGLES = [180, 90, 135, 45];
+const cleanText = (v, max) => String(v ?? '').replace(/\r\n?/g, '\n').trim().slice(0, max);
+function cleanLook(b) {
+  const list = (v, max) => (Array.isArray(v) ? v : []).slice(0, max);
+  const fonts = {};
+  for (const [file, mood] of Object.entries(b?.fonts && typeof b.fonts === 'object' ? b.fonts : {})) {
+    if (safeName(file) && kindOf(file) === 'font') fonts[file] = clean(mood, 40);
+  }
+  return {
+    colors: list(b?.colors, 12).map((c) => ({ label: clean(c?.label, 40), hex: String(c?.hex || '').toLowerCase() })).filter((c) => HEX_RE.test(c.hex)),
+    gradients: list(b?.gradients, 8).map((g) => ({ label: clean(g?.label, 40), from: String(g?.from || '').toLowerCase(), to: String(g?.to || '').toLowerCase(), angle: ANGLES.includes(Number(g?.angle)) ? Number(g.angle) : 180 }))
+      .filter((g) => HEX_RE.test(g.from) && HEX_RE.test(g.to)),
+    fonts, feel: cleanText(b?.feel, 2000), about: cleanText(b?.about, 6000),
+  };
+}
+const readLook = () => cleanLook(readJson(brandLookFile, {}));
+const fontFiles = () => readdirSafe(fontsDir).filter((n) => kindOf(n) === 'font').sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+// What a branded copy needs: at least a color or a font to brand with.
+const lookReady = (l = readLook()) => l.colors.length > 0 || fontFiles().length > 0;
 
 // What the editor is told about the end of one video.
 function contactPrompt(choice) {
@@ -269,7 +314,7 @@ function contactPrompt(choice) {
     const p = readPeople().find((x) => x.id === choice.id);
     if (p) {
       return `This video is for one sales person. Contact part: "Look for ${onScreen(p)}"` +
-        `${p.lines.length ? `, then ${p.lines.map((l) => `${l.label}: ${l.value}`).join('; ')}` : ''}. ` +
+        `${contactLines(p).length ? `, then ${contactLines(p).map((l) => `${l.label}: ${l.value}`).join('; ')}` : ''}. ` +
         `Refer to them as ${{ she: 'she/her', he: 'he/him', they: 'they/them' }[p.pronoun]}.`;
     }
   }
@@ -285,6 +330,43 @@ function contactLabel(choice) {
   return p ? `For ${onScreen(p)}` : 'For all sales';
 }
 
+// ---------- learned styles ----------
+// my-styles/<id>/ is one named style learned from a sample video: meta.json { name, createdAt, reply },
+// source.* (the sample), and once learned, style.md plus storyboard frames 01.jpg… described in storyboard.json.
+
+const STYLE_ID_RE = /^[a-z0-9-]{1,60}$/;
+const styleDir = (id) => join(dirs.styles, id);
+function listStyles() {
+  return readdirSafe(dirs.styles).filter((id) => STYLE_ID_RE.test(id) && statSafeDir(styleDir(id))).map((id) => {
+    const dir = styleDir(id);
+    const meta = readJson(join(dir, 'meta.json'), {});
+    const names = readdirSafe(dir);
+    const board = readJson(join(dir, 'storyboard.json'), null);
+    // Frames Claude described in storyboard.json, or else every numbered frame in the folder.
+    const frames = (Array.isArray(board) ? board : names.filter((n) => /^\d+\.jpe?g$/i.test(n)).sort().map((file) => ({ file })))
+      .filter((f) => safeName(f?.file) && names.includes(f.file) && kindOf(f.file) === 'image')
+      .map((f) => ({ file: f.file, at: Number.isFinite(Number(f.at)) && f.at !== null ? Number(f.at) : null, note: clean(f.note, 240), mtime: statSafe(join(dir, f.file)) }));
+    return {
+      id, name: clean(meta.name, 60) || id, createdAt: meta.createdAt || statSafe(dir), ready: existsSync(join(dir, 'style.md')),
+      source: names.find((n) => n.startsWith('source.') && kindOf(n) === 'video') || null, frames, reply: meta.reply || null,
+    };
+  }).sort((a, b) => b.createdAt - a.createdAt);
+}
+// A free folder id made from a style name: "Fast promo" -> fast-promo, then fast-promo-2, ...
+function newStyleId(name) {
+  const base = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 50) || 'style';
+  let id = base;
+  for (let i = 2; existsSync(styleDir(id)); i++) id = `${base}-${i}`;
+  return id;
+}
+const findStyle = (id) => (STYLE_ID_RE.test(String(id || '')) && listStyles().find((x) => x.id === id)) || null;
+// What the editor is told when a video uses a learned style.
+function stylePrompt(id) {
+  const st = findStyle(id);
+  return st?.ready ? `Style for this video: "${st.name}". Use my-styles/${st.id}/style.md in place of my-style.md, and make it look like ` +
+    `the storyboard frames in my-styles/${st.id}/ (described in its storyboard.json), as CLAUDE.md says.` : '';
+}
+
 function brandState() {
   const style = readText(styleFile);
   const broll = readdirSafe(brollDir).filter((n) => kindOf(n) === 'video').map((name) => {
@@ -293,7 +375,11 @@ function brandState() {
     preview(full, st);
     return { name, category: name.match(BROLL_RE)?.[1]?.toLowerCase() || 'other', size: st.size, mtime: st.mtimeMs, ...probe(full, st.mtimeMs) };
   }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-  const sounds = listFolder('sounds').filter((f) => f.kind === 'audio');
+  const images = readdirSafe(imagesDir).filter((n) => kindOf(n) === 'image').map((name) => {
+    const st = statSync(join(imagesDir, name));
+    return { name, size: st.size, mtime: st.mtimeMs };
+  }).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  const sounds = musicFiles();
   const logo = slotFile('logo');
   const social = slotFile('social');
   const people = readPeople();
@@ -307,11 +393,12 @@ function brandState() {
   return {
     logo: logo && { name: logo, mtime: statSync(join(dirs.brand, logo)).mtimeMs },
     social: social && { name: social, mtime: statSync(join(dirs.brand, social)).mtimeMs },
-    broll, people: people.map((p) => ({ ...p, onScreen: onScreen(p) })), contact, needs, has,
+    broll, images, people: people.map((p) => ({ ...p, onScreen: onScreen(p) })), contact, needs, has,
     categories: [...new Set([...(styleCats.length ? styleCats : DEFAULT_CATEGORIES), ...broll.map((b) => b.category)])],
     pack: readJson(packFile, null),
     brandRules: Boolean(readText(brandRulesFile)?.trim()),
-    sizes: { broll: broll.reduce((s, b) => s + b.size, 0), music: sounds.reduce((s, f) => s + f.size, 0) },
+    look: (() => { const l = readLook(); return { ...l, fonts: fontFiles().map((name) => ({ name, mood: l.fonts[name] || '', mtime: statSafe(join(fontsDir, name)) })), ready: lookReady(l) }; })(),
+    sizes: { broll: broll.reduce((s, b) => s + b.size, 0), images: images.reduce((s, b) => s + b.size, 0), music: sounds.reduce((s, f) => s + f.size, 0) },
   };
 }
 const locked = () => existsSync(packFile);
@@ -333,13 +420,16 @@ function tarHeader(name, size, mtime = Date.now()) {
 const PACK_PATHS = [
   /^pack\.json$/, /^style\.md$/, /^brand-rules\.md$/, /^contact\.json$/, /^people\.json$/, /^logo\.(png|jpe?g|webp|gif|svg)$/i, /^social\.(png|jpe?g|webp|gif)$/i,
   /^broll\/broll_[a-z0-9-]+_\d+\.(mp4|mov|m4v|webm|mkv)$/i, /^music\/\d+\.(mp3|wav|m4a|aac|ogg|flac)$/i,
+  /^images\/\d+\.(png|jpe?g|webp|gif|svg)$/i, /^brand\.json$/, /^fonts\/\d+\.(ttf|otf|woff2?)$/i,
+  /^styles\/[a-z0-9-]{1,60}\/(style\.md|meta\.json|storyboard\.json|\d+\.jpe?g)$/i,
 ];
 
-async function exportPack(res, { name, broll, music, people }) {
+async function exportPack(res, { name, broll, music, images, styles, people }) {
   const entries = [];
   const add = (path, file) => existsSync(file) && entries.push({ path, file, size: statSync(file).size, mtime: statSync(file).mtimeMs });
   add('style.md', styleFile);
   add('contact.json', brandContactFile);
+  add('brand.json', brandLookFile);
   if (people) add('people.json', peopleFile);
   const rules = [readText(brandRulesFile), readText(join(root, 'my-rules.md'))].filter((t) => t?.trim()).join('\n\n');
   const logo = slotFile('logo');
@@ -349,13 +439,35 @@ async function exportPack(res, { name, broll, music, people }) {
   if (broll) for (const n of readdirSafe(brollDir)) if (BROLL_RE.test(n) && kindOf(n) === 'video') add(`broll/${n}`, join(brollDir, n));
   const musicNames = {};
   if (music) {
-    listFolder('sounds').filter((f) => f.kind === 'audio').forEach((f, i) => {
+    musicFiles().forEach((f, i) => {
       const path = `music/${String(i + 1).padStart(2, '0')}${extname(f.name).toLowerCase()}`;
       musicNames[path] = f.name;
       add(path, f.folder ? join(dirs.sounds, f.folder, f.name) : join(dirs.sounds, f.name));
     });
   }
-  const manifest = Buffer.from(JSON.stringify({ format: 1, name, createdAt: Date.now(), includes: { broll, music, people }, musicNames }, null, 2));
+  // Pictures travel as images/01.png and get their real names back from the manifest, like music.
+  const imageNames = {};
+  if (images) {
+    readdirSafe(imagesDir).filter((n) => kindOf(n) === 'image').forEach((n, i) => {
+      const path = `images/${String(i + 1).padStart(2, '0')}${extname(n).toLowerCase()}`;
+      imageNames[path] = n;
+      add(path, join(imagesDir, n));
+    });
+  }
+  // Fonts travel as fonts/01.ttf and get their real names back from the manifest, so brand.json still matches.
+  const fontNames = {};
+  fontFiles().forEach((n, i) => {
+    const path = `fonts/${String(i + 1).padStart(2, '0')}${extname(n).toLowerCase()}`;
+    fontNames[path] = n;
+    add(path, join(fontsDir, n));
+  });
+  // Learned styles go without their sample video: the editor only needs style.md and the storyboard.
+  if (styles) {
+    for (const st of listStyles().filter((x) => x.ready)) {
+      for (const n of ['style.md', 'meta.json', 'storyboard.json', ...st.frames.map((f) => f.file)]) add(`styles/${st.id}/${n}`, join(styleDir(st.id), n));
+    }
+  }
+  const manifest = Buffer.from(JSON.stringify({ format: 1, name, createdAt: Date.now(), includes: { broll, music, images, styles, people }, musicNames, imageNames, fontNames }, null, 2));
   const file = `${name.replace(/[^\w .-]+/g, '').trim() || 'brand'}.brandpack`;
   res.writeHead(200, { 'content-type': 'application/x-tar', 'content-disposition': `attachment; filename="${file}"` });
   const write = async (buf) => { if (!res.write(buf)) await once(res, 'drain'); };
@@ -404,14 +516,17 @@ async function importPack(tmp) {
   const stage = `${tmp}-files`;
   mkdirSync(join(stage, 'broll'), { recursive: true });
   mkdirSync(join(stage, 'music'), { recursive: true });
+  mkdirSync(join(stage, 'images'), { recursive: true });
+  mkdirSync(join(stage, 'fonts'), { recursive: true });
   try {
     for (const e of entries) {
       if (e.name === 'pack.json') continue;
       const dest = join(stage, e.name.toLowerCase());
+      mkdirSync(dirname(dest), { recursive: true });
       if (e.size) await pipeline(createReadStream(tmp, { start: e.start, end: e.start + e.size - 1 }), createWriteStream(dest));
       else writeFileSync(dest, '');
     }
-    for (const d of [dirs.brand, brollDir]) mkdirSync(d, { recursive: true });
+    for (const d of [dirs.brand, brollDir, imagesDir, fontsDir]) mkdirSync(d, { recursive: true });
     const has = (prefix) => entries.some((e) => e.name.startsWith(prefix));
     if (existsSync(styleFile)) copyFileSync(styleFile, `${styleFile}.bak`);
     copyFileSync(join(stage, 'style.md'), styleFile);
@@ -443,9 +558,48 @@ async function importPack(tmp) {
       mkdirSync(musicDir, { recursive: true });
       for (const n of music) renameSync(join(stage, 'music', n), join(musicDir, safeName(String(manifest.musicNames?.[`music/${n}`] || '')) || n));
     }
+    // The team's pictures join this computer's; a picture with the same name is replaced by the pack's.
+    for (const n of readdirSafe(join(stage, 'images'))) {
+      const real = safeName(String(manifest.imageNames?.[`images/${n}`] || ''));
+      renameSync(join(stage, 'images', n), join(imagesDir, real && kindOf(real) === 'image' ? real : n));
+    }
+    // The team's brand look replaces this one; its fonts join this computer's (same name = the pack's).
+    if (has('brand.json')) writeJson(brandLookFile, cleanLook(readJson(join(stage, 'brand.json'), {})));
+    for (const n of readdirSafe(join(stage, 'fonts'))) {
+      const real = safeName(String(manifest.fontNames?.[`fonts/${n}`] || ''));
+      renameSync(join(stage, 'fonts', n), join(fontsDir, real && kindOf(real) === 'font' ? real : n));
+    }
+    // The team's learned styles join this computer's. One with the same id is replaced (the old one goes
+    // to the Trash), unless it is being learned or used right now.
+    for (const id of readdirSafe(join(stage, 'styles'))) {
+      const from = join(stage, 'styles', id);
+      if (!STYLE_ID_RE.test(id) || !existsSync(join(from, 'style.md'))) continue;
+      if (job?.styleId === id || queue.some((q) => q.styleId === id)) continue;
+      if (statSafeDir(styleDir(id))) { try { toTrash([styleDir(id)]); } catch { continue; } }
+      renameSync(from, styleDir(id));
+    }
   } finally { rmSync(stage, { recursive: true, force: true }); }
   writeJson(packFile, { name: brandName, createdAt: manifest.createdAt || null, importedAt: Date.now() });
   return { name: brandName };
+}
+
+// A clip stored with non-square pixels (for example a tall video squeezed into 1920x1080 plus a stretch
+// flag) looks right in players but comes out flat or thin in tools that use the raw pixels. Re-save it in
+// the background with square pixels at the shape players show, keeping the long side.
+function squarePixels(full) {
+  const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height,sample_aspect_ratio', '-of', 'json', full], { encoding: 'utf8' });
+  let s; try { s = JSON.parse(r.stdout).streams?.[0]; } catch { return; }
+  const [n, d] = String(s?.sample_aspect_ratio || '1:1').split(':').map(Number);
+  if (!s?.width || !s.height || !n || !d || n === d) return;
+  const shape = (s.width * n) / d / s.height;
+  const long = Math.max(s.width, s.height);
+  const even = (x) => Math.round(x / 2) * 2;
+  const [w, h] = shape < 1 ? [even(long * shape), long] : [long, even(long / shape)];
+  const tmp = join(dirname(full), `.squaring-${randomUUID()}`);
+  const p = spawn('ffmpeg', ['-v', 'error', '-y', '-i', full, '-map', '0:v:0', '-map', '0:a?', '-c:a', 'copy',
+    '-vf', `scale=${w}:${h}:flags=lanczos,setsar=1`, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-movflags', '+faststart', '-f', 'mp4', tmp]);
+  p.on('error', () => {});
+  p.on('close', (code) => { if (code === 0 && existsSync(full)) { renameSync(tmp, full); pushState(); } else rmSync(tmp, { force: true }); });
 }
 
 // Video length, cached by name + mtime.
@@ -590,8 +744,25 @@ function notDone(slug) {
   ];
 }
 
+// Preview first: a 5-second sample <slug>-preview.mp4 and storyboard frames <slug>-preview-01.jpg… in outbox/.
+const PREVIEW_RE = /^(.+?)-preview(?:-(\d+)\.jpe?g|\.mp4)$/i;
+function previewsBySlug() {
+  const map = new Map();
+  for (const f of listFolder('outbox')) {
+    const m = f.name.match(PREVIEW_RE);
+    if (!m) continue;
+    const p = map.get(m[1]) || { video: null, frames: [], mtime: 0 };
+    if (m[2]) p.frames.push(f.name); else p.video = f.name;
+    p.mtime = Math.max(p.mtime, f.mtime);
+    map.set(m[1], p);
+  }
+  for (const p of map.values()) p.frames.sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+  return map;
+}
+
 function listProjects() {
   const versions = versionsBySlug();
+  const previews = previewsBySlug();
   const slugs = new Set([...versions.keys()]);
   for (const f of readdirSync(projectsDir)) if (f.endsWith('.json')) slugs.add(f.slice(0, -5));
   return [...slugs].map((slug) => {
@@ -602,6 +773,7 @@ function listProjects() {
     return {
       ...pub, slug, versions: v, updatedAt: updated, title: rec.title || prettyTitle(slug),
       sources: rec.sources || (rec.source ? [rec.source] : terminalSources(slug)), notDone: v.length ? notDone(slug) : [], canRetry: Boolean(lastRequest),
+      preview: previews.get(slug) || null,
     };
   }).sort((a, b) => b.updatedAt - a.updatedAt);
 }
@@ -619,6 +791,81 @@ function nextVersion(slug, horizontal = false) {
     .filter((v) => v.label.startsWith('horizontal') === horizontal)
     .map((v) => Number(v.label.match(/v(\d+)/)?.[1] || 0));
   return Math.max(0, ...nums) + 1;
+}
+
+// ---------- quick edits (ffmpeg on this computer, no AI) ----------
+// Cut a part out of a draft, or put a clip in between, saved as the next version. The AI never sees
+// these, so each one is remembered on the project and handed to it with the next note or final.
+
+const clock = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
+function ffmpeg(args) {
+  return new Promise((done) => {
+    const p = spawn('ffmpeg', ['-y', '-v', 'error', ...args]);
+    let err = '';
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', () => done(false));
+    p.on('close', (code) => { if (code) console.error(err.slice(-800)); done(code === 0); });
+  });
+}
+function streamsOf(full) {
+  const r = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,r_frame_rate,sample_rate', '-of', 'json', full], { encoding: 'utf8' });
+  try { return JSON.parse(r.stdout).streams || []; } catch { return []; }
+}
+const ENCODE = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-f', 'mp4'];
+
+async function quickEdit(slug, from, edit) {
+  const v = (versionsBySlug().get(slug) || []).find((x) => x.file === from);
+  if (!v) return { error: 'That version is not here anymore.' };
+  if (job?.slug === slug || queue.some((q) => q.slug === slug)) return { error: 'The editor is working on this video. Try again when it has finished.' };
+  const src = join(dirs.outbox, from);
+  const { duration: dur, width: W, height: H } = probe(src, v.mtime);
+  if (!dur || !W) return { error: 'Could not read that video.' };
+  const horizontal = v.label.startsWith('horizontal');
+  const out = `${slug}-${horizontal ? 'horizontal-' : ''}v${nextVersion(slug, horizontal)}.mp4`;
+  const tmp = join(dirs.outbox, `.quick-${randomUUID()}.mp4`);
+  let args, said, line;
+  if (edit.cut) {
+    const a = Math.max(0, Number(edit.cut[0]) || 0);
+    const b = Math.min(dur, Number(edit.cut[1]) || 0);
+    if (!(b - a >= 0.1)) return { error: 'Pick where the cut ends after where it starts.' };
+    if (dur - (b - a) < 0.5) return { error: 'That would cut the whole video.' };
+    const keep = `not(between(t,${a.toFixed(3)},${b.toFixed(3)}))`;
+    args = ['-i', src, '-vf', `select='${keep}',setpts=N/FRAME_RATE/TB`, '-af', `aselect='${keep}',asetpts=N/SR/TB`, ...ENCODE, tmp];
+    said = `Cut ${clock(a)} to ${clock(b)}.`;
+    line = `cut ${clock(a)}–${clock(b)} out of outbox/${from}, saved as outbox/${out}`;
+  } else {
+    const at = Math.min(dur, Math.max(0, Number(edit.at) || 0));
+    const clip = edit.clip;
+    const cm = probe(clip, statSafe(clip));
+    if (!cm.duration || !cm.width) return { error: 'That clip is not a video this computer can read.' };
+    const ss = streamsOf(src);
+    const fps = ss.find((s) => s.codec_type === 'video')?.r_frame_rate || '30';
+    const sr = ss.find((s) => s.codec_type === 'audio')?.sample_rate || '48000';
+    const vf = `fps=${fps},format=yuv420p,setsar=1,setpts=PTS-STARTPTS`;
+    const af = `aformat=sample_rates=${sr}:channel_layouts=stereo,asetpts=PTS-STARTPTS`;
+    // The clip fills the frame (cropped, not letterboxed), and plays whole with its own sound.
+    let g = `[1:v]scale=trunc(iw*sar/2)*2:ih,setsar=1,scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},${vf}[cv];`
+      + (streamsOf(clip).some((s) => s.codec_type === 'audio') ? `[1:a]${af}[ca];` : `anullsrc=r=${sr}:cl=stereo,atrim=0:${cm.duration.toFixed(3)},${af}[ca];`);
+    const order = [];
+    if (at > 0.05) { g += `[0:v]trim=0:${at.toFixed(3)},${vf}[v0];[0:a]atrim=0:${at.toFixed(3)},${af}[a0];`; order.push('[v0][a0]'); }
+    order.push('[cv][ca]');
+    if (at < dur - 0.05) { g += `[0:v]trim=${at.toFixed(3)},${vf}[v2];[0:a]atrim=${at.toFixed(3)},${af}[a2];`; order.push('[v2][a2]'); }
+    g += `${order.join('')}concat=n=${order.length}:v=1:a=1[v][a]`;
+    args = ['-i', src, '-i', clip, '-filter_complex', g, '-map', '[v]', '-map', '[a]', ...ENCODE, tmp];
+    const rel = relative(root, clip).split('\\').join('/');
+    said = `Put ${basename(clip)} in at ${clock(at)}.`;
+    line = `put ${rel} in at ${clock(at)} of outbox/${from} (the whole clip, with its own sound, then the video continues), saved as outbox/${out}`;
+  }
+  if (!await ffmpeg(args)) { rmSync(tmp, { force: true }); return { error: 'Could not make the new version. Try again, or send it as a note.' }; }
+  renameSync(tmp, join(dirs.outbox, out));
+  const rec = loadProject(slug) || { slug, history: [], fromTerminal: true };
+  rec.history.push({ role: 'you', text: said, at: Date.now() },
+    { role: 'editor', text: `Done on this computer, no AI used. It's saved as ${out.match(VERSION_RE)[2].replace('horizontal-', 'YouTube ')}.`, at: Date.now() });
+  rec.quickEdits = [...(rec.quickEdits || []), line];
+  rec.updatedAt = Date.now();
+  saveProject(rec);
+  pushState();
+  return { ok: true, file: out };
 }
 
 function newSlug(fileName) {
@@ -653,7 +900,7 @@ function broadcast(event, payload) {
   for (const res of clients) res.write(msg);
 }
 const publicJob = () => job && {
-  id: job.id, kind: job.kind, slug: job.slug, title: job.title, steps: job.steps.slice(-60),
+  id: job.id, kind: job.kind, slug: job.slug, styleId: job.styleId, title: job.title, steps: job.steps.slice(-60),
   todos: job.todos, startedAt: job.startedAt, stopping: job.stopping || false,
 };
 
@@ -676,6 +923,7 @@ function describeTool(name, input = {}) {
     return input.description || 'Working';
   }
   if (name === 'Read') {
+    if (/my-styles[\\/].*\.jpe?g$/i.test(file)) return 'Studying the frames';
     if (/my-style|my-rules/.test(file)) return 'Reading your style and rules';
     if (/SKILL\.md|CLAUDE\.md/.test(file)) return 'Reading the editing playbook';
     if (/\.json$/.test(file) && /raw/.test(file)) return 'Reading the transcript';
@@ -684,6 +932,8 @@ function describeTool(name, input = {}) {
   if (name === 'Write' || name === 'Edit') {
     if (/my-rules\.md$/.test(file)) return 'Saving a new rule';
     if (/my-style\.md$/.test(file)) return 'Updating your style';
+    if (/my-styles[\\/].*storyboard\.json$/.test(file)) return 'Making the storyboard';
+    if (/my-styles[\\/].*style\.md$/.test(file)) return 'Writing down the style';
     if (/\.html$/.test(file)) return 'Designing captions and motion graphics';
     return 'Building the edit';
   }
@@ -723,10 +973,11 @@ function handleEvent(ev) {
   }
 }
 
-function startJob({ kind, slug = null, title, prompt, resume = null }) {
+function startJob({ kind, slug = null, styleId = null, title, prompt, resume = null }) {
   if (job) return { error: 'The editor is already working on something. Wait for it to finish, or stop it.' };
   const s = getSettings();
-  writeFileSync(noteFile, APP_NOTE);
+  const brandCheck = s.brandCheck && ['edit', 'notes', 'horizontal'].includes(kind);
+  writeFileSync(noteFile, brandCheck ? `${APP_NOTE} Brand check is on: follow "Brand check" in CLAUDE.md before you save each draft.` : APP_NOTE);
   const args = ['-p', '--output-format', 'stream-json', '--verbose', '--permission-mode', s.permissionMode,
     '--append-system-prompt-file', noteFile];
   if (s.model) args.push('--model', s.model);
@@ -739,8 +990,8 @@ function startJob({ kind, slug = null, title, prompt, resume = null }) {
     ? spawn('claude', args.map((a) => (a === noteFile ? `"${a}"` : a)), { cwd: root, shell: true, windowsHide: true })
     : spawn('claude', args, { cwd: root, detached: true });
   const versionsBefore = slug ? (versionsBySlug().get(slug) || []).map((v) => `${v.file}:${v.mtime}`).join() : '';
-  job = { id: randomUUID(), kind, slug, title, steps: [], todos: [], startedAt: Date.now(), proc, sessionId: resume, rulesBefore, versionsBefore };
-  addStep({ edit: 'Getting your clips ready', style: 'Updating your style', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version' }[kind] || 'Reading your notes');
+  job = { id: randomUUID(), kind, slug, styleId, title, steps: [], todos: [], startedAt: Date.now(), proc, sessionId: resume, rulesBefore, versionsBefore };
+  addStep({ go: 'Building the full edit', edit: 'Getting your clips ready', style: 'Updating your style', learn: 'Watching your sample video', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version' }[kind] || 'Reading your notes');
   proc.stdin.end(prompt);
 
   let buf = '';
@@ -781,12 +1032,17 @@ function finishJob(code, errText) {
     p.sessionId = j.sessionId || p.sessionId;
     p.history.push({ role: 'editor', text, error, stopped: Boolean(j.stopping), at: Date.now(), steps: j.steps.length });
     p.status = error ? 'error' : 'ready';
+    if (!error && newVersion && ['notes', 'final', 'horizontal', 'go'].includes(j.kind)) delete p.quickEdits;
     p.updatedAt = Date.now();
     saveProject(p);
   }
-  if (j.kind === 'style') writeJson(join(data, 'style-reply.json'), { text, error, at: Date.now() });
+  if (j.kind === 'style') writeJson(join(data, 'style-reply.json'), { text, error, at: Date.now(), styleId: j.styleId || null });
+  if (j.kind === 'learn' && j.styleId) {
+    const f = join(styleDir(j.styleId), 'meta.json');
+    if (existsSync(f)) writeJson(f, { ...readJson(f, {}), reply: { text, error, at: Date.now() } });
+  }
   if (j.kind === 'setup') { writeJson(join(data, 'setup-reply.json'), { text, error, at: Date.now() }); toolCache = null; }
-  broadcast('done', { id: j.id, slug: j.slug, kind: j.kind, error, text, ruleSaved, newVersion });
+  broadcast('done', { id: j.id, slug: j.slug, styleId: j.styleId, kind: j.kind, error, text, ruleSaved, newVersion });
   pushState();
   setTimeout(nextInQueue, 800);
 }
@@ -798,15 +1054,26 @@ function finishJob(code, errText) {
 const queueFile = join(data, 'queue.json');
 let queue = readJson(queueFile, []);
 const saveQueue = () => writeJson(queueFile, queue);
-const publicQueue = () => queue.map(({ id, type, slug, title }) => ({ id, type, slug, title }));
+const publicQueue = () => queue.map(({ id, type, slug, styleId, title }) => ({ id, type, slug, styleId, title }));
 
 function buildJob(req) {
   const p = req.slug ? listProjects().find((x) => x.slug === req.slug) : null;
   if (req.slug && !p) return null;
-  const ctx = p ? contextFor(p) : '';
+  const quick = p?.quickEdits?.length ? `Since the last render the user made quick edits in the app with ffmpeg, which are not in the project files yet: ` +
+    `${p.quickEdits.join('; ')}. Redo them in the project first so they carry into this render. ` : '';
+  const ctx = p ? `${contextFor(p)}${p.style && stylePrompt(p.style) ? `${stylePrompt(p.style)} ` : ''}${quick}` : '';
   const resume = p?.sessionId || null;
-  const base = { kind: req.type, slug: req.slug || null, title: p?.title || req.title, resume };
+  const base = { kind: req.type, slug: req.slug || null, styleId: req.styleId || null, title: p?.title || req.title, resume };
   if (req.type === 'edit') return { ...base, prompt: req.prompt, resume: null };
+  // Still at the preview: notes make a new preview, and "looks good" builds the full first draft.
+  if (req.type === 'notes' && p.preview && !p.versions.length) {
+    return { ...base, prompt: `${ctx}Notes on the preview of ${req.slug}:\n${req.text}\n\nApply them and make a new preview, as "Preview first" in CLAUDE.md says. ` +
+      'Do not render the full draft yet.' };
+  }
+  if (req.type === 'go') {
+    return { ...base, prompt: `${ctx}The preview of ${req.slug} looks good. Finish the full edit as planned, render it, and save the first draft as ` +
+      `outbox/${req.slug}-v1.mp4. Then follow steps 6 and 7 of "Editing" in CLAUDE.md.` };
+  }
   if (req.type === 'notes') {
     const horizontal = Boolean(req.horizontal);
     const out = `outbox/${req.slug}-${horizontal ? 'horizontal-' : ''}v${nextVersion(req.slug, horizontal)}.mp4`;
@@ -824,9 +1091,17 @@ function buildJob(req) {
       `text placement, not a crop). Save it as outbox/${req.slug}-horizontal-v${nextVersion(req.slug, true)}.mp4.` };
   }
   if (req.type === 'style') {
-    if (locked()) return null;
-    return { ...base, title: 'Your style', prompt: 'Update my-style.md with this change to my style. Keep everything else as it is, ' +
-      `and keep the file's existing format. Do not edit any video. The change: ${req.text}` };
+    const st = req.styleId ? findStyle(req.styleId) : null;
+    if (req.styleId ? !st?.ready : locked()) return null;
+    const file = st ? `my-styles/${st.id}/style.md` : 'my-style.md';
+    return { ...base, title: st ? st.name : 'Your style', prompt: `Update ${file} with this change to ${st ? `the "${st.name}" style` : 'my style'}. ` +
+      `Keep everything else as it is, and keep the file's existing format. Do not edit any video. The change: ${req.text}` };
+  }
+  if (req.type === 'learn') {
+    const st = findStyle(req.styleId);
+    if (!st?.source) return null;
+    return { ...base, title: `Learning “${st.name}”`, prompt: `Learn a new style called "${st.name}" from the sample video my-styles/${st.id}/${st.source}. ` +
+      `Follow "Learning a style from a video" in CLAUDE.md, working in my-styles/${st.id}/.` };
   }
   if (req.type === 'setup') {
     return { ...base, title: 'Setup', prompt: [
@@ -980,15 +1255,21 @@ function getState() {
     settings: getSettings(),
     inbox,
     folders,
-    sounds: listFolder('sounds'),
+    sounds: listFolder('sounds').filter((f) => !isEffect(f)),
+    sfx: listFolder('sounds').filter((f) => f.kind === 'audio' && isEffect(f)).map((f) => ({ name: f.name, folder: f.folder || '' })),
     outbox: listFolder('outbox').filter((f) => f.kind === 'video'),
     projects,
     brand: brandState(),
+    styles: listStyles(),
     job: publicJob(),
     queue: publicQueue(),
     setupReply: readJson(join(data, 'setup-reply.json'), null),
+    // The page loads new code right away, but this server keeps running the old code until it restarts.
+    outdated: statSafe(selfFile) !== selfMtime,
   };
 }
+const selfFile = fileURLToPath(import.meta.url);
+const selfMtime = statSafe(selfFile);
 
 // ---------- setup runner (node setup.mjs) ----------
 
@@ -1077,7 +1358,7 @@ const server = createServer(async (req, res) => {
   try {
     // Media and thumbnails: /media/<area>/<name>, /thumb/<area>/<name>
     let m;
-    if ((m = path.match(/^\/(media|thumb|preview)\/(inbox|outbox|sounds|brand)\/(?:([^/]+)\/)?([^/]+)$/))) {
+    if ((m = path.match(/^\/(media|thumb|preview)\/(inbox|outbox|sounds|brand|styles)\/(?:([^/]+)\/)?([^/]+)$/))) {
       const [, what, area, folder, raw] = m;
       const name = safeName(raw);
       if (!name || (folder && !safeName(folder))) { res.writeHead(400); return res.end(); }
@@ -1114,6 +1395,7 @@ const server = createServer(async (req, res) => {
       const ext = extname(name).toLowerCase();
       let dir = dirs[area];
       let replaceSlot = null;
+      let squareAfter = false;
       if (area === 'brand') {
         // Brand files get fixed names the editor can rely on: logo.png, social.jpg, broll/broll_<category>_07.mov.
         const slot = url.searchParams.get('slot');
@@ -1126,6 +1408,15 @@ const server = createServer(async (req, res) => {
           dir = brollDir;
           const nums = readdirSafe(brollDir).map((n) => n.match(BROLL_RE)).filter((x) => x && x[1].toLowerCase() === cat).map((x) => Number(x[2]));
           name = `broll_${cat}_${String(Math.max(0, ...nums) + 1).padStart(2, '0')}${ext}`;
+          squareAfter = true;
+        } else if (slot === 'image') {
+          if (kindOf(name) !== 'image') return send(res, 400, { error: `${name} is not a picture (PNG, JPG or WebP).` });
+          dir = imagesDir;
+          name = freeName(imagesDir, name);
+        } else if (slot === 'font') {
+          if (kindOf(name) !== 'font') return send(res, 400, { error: `${name} is not a font file (TTF, OTF, WOFF or WOFF2).` });
+          dir = fontsDir;
+          name = freeName(fontsDir, name);
         } else return send(res, 400, { error: 'Unknown brand slot.' });
       } else {
         const folder = area === 'inbox' && folderName(url.searchParams.get('folder'));
@@ -1138,6 +1429,7 @@ const server = createServer(async (req, res) => {
       out.on('finish', () => {
         if (replaceSlot) for (const n of readdirSafe(dir)) if (n.toLowerCase().startsWith(`${replaceSlot}.`)) rmSync(join(dir, n), { force: true });
         renameSync(tmp, join(dir, name)); pushState(); send(res, 200, { ok: true, name });
+        if (squareAfter) squarePixels(join(dir, name));
       });
       out.on('error', () => { rmSync(tmp, { force: true }); send(res, 500, { error: 'Could not save the file. Is the disk full?' }); });
       req.on('aborted', () => { out.destroy(); rmSync(tmp, { force: true }); });
@@ -1175,6 +1467,15 @@ const server = createServer(async (req, res) => {
       const b = await body(req);
       const c = { name: clean(b.name, 80), lines: cleanLines(b.lines) };
       if (c.name || c.lines.length) writeJson(brandContactFile, c); else rmSync(brandContactFile, { force: true });
+      pushState();
+      return send(res, 200, { ok: true });
+    }
+    // Each panel saves only its own part (colors and feel, the font moods, or about the company).
+    if (path === '/api/brand/look' && req.method === 'POST') {
+      const b = await body(req);
+      const cur = readLook();
+      const next = cleanLook({ ...cur, ...Object.fromEntries(['colors', 'gradients', 'fonts', 'feel', 'about'].filter((k) => k in b).map((k) => [k, b[k]])) });
+      writeJson(brandLookFile, next);
       pushState();
       return send(res, 200, { ok: true });
     }
@@ -1229,7 +1530,9 @@ const server = createServer(async (req, res) => {
       const busy = new Set(busyInbox());
       const targets = [];
       const records = [];
+      const versions = [];
       const people = [];
+      const fontsGone = [];
       for (const it of Array.isArray(items) ? items : []) {
         if (it?.area === 'inbox') {
           const rel = safePath(it.path);
@@ -1242,6 +1545,12 @@ const server = createServer(async (req, res) => {
         } else if (it?.area === 'broll') {
           const n = safeName(it.path);
           if (n && BROLL_RE.test(n)) targets.push(join(brollDir, n));
+        } else if (it?.area === 'images') {
+          const n = safeName(it.path);
+          if (n && kindOf(n) === 'image' && existsSync(join(imagesDir, n))) targets.push(join(imagesDir, n));
+        } else if (it?.area === 'font') {
+          const n = safeName(it.path);
+          if (n && kindOf(n) === 'font' && existsSync(join(fontsDir, n))) { targets.push(join(fontsDir, n)); fontsGone.push(n); }
         } else if (it?.area === 'sounds') {
           const parts = String(it.path || '').split('/');
           if (parts.length <= 2 && parts.every((x) => safeName(x))) targets.push(join(dirs.sounds, ...parts));
@@ -1250,16 +1559,40 @@ const server = createServer(async (req, res) => {
           if (!/^[a-z0-9-]+$/.test(slug)) continue;
           if (job?.slug === slug || queue.some((q) => q.slug === slug)) return send(res, 409, { error: 'That video is being edited or waiting in line. Stop or remove it first.' });
           for (const v of versionsBySlug().get(slug) || []) targets.push(join(dirs.outbox, v.file));
+          const pv = previewsBySlug().get(slug);
+          for (const n of pv ? [pv.video, ...pv.frames].filter(Boolean) : []) targets.push(join(dirs.outbox, n));
           const kitDir = join(root, 'kit', 'video-projects', slug);
           if (statSafeDir(kitDir)) targets.push(kitDir);
           records.push(slug);
+        } else if (it?.area === 'version') {
+          const n = safeName(it.path);
+          const vm = n?.match(VERSION_RE);
+          if (!vm || !existsSync(join(dirs.outbox, n))) continue;
+          if (job?.slug === vm[1] || queue.some((q) => q.slug === vm[1])) return send(res, 409, { error: 'That video is being edited or waiting in line. Delete versions when that is done.' });
+          targets.push(join(dirs.outbox, n));
+          versions.push([vm[1], n]);
         } else if (it?.area === 'person') {
           people.push(String(it.path || ''));
+        } else if (it?.area === 'style') {
+          const st = findStyle(it.path);
+          if (!st) continue;
+          if (job?.styleId === st.id || queue.some((q) => q.styleId === st.id)) return send(res, 409, { error: 'That style is being learned or used right now. Delete it when that is done.' });
+          targets.push(styleDir(st.id));
         }
       }
       try { toTrash(targets); } catch (e) { return send(res, 500, { error: e.message }); }
       for (const slug of records) rmSync(projectFile(slug), { force: true });
+      for (const [slug, file] of versions) {
+        const rec = loadProject(slug);
+        if (!rec?.quickEdits) continue;
+        // Forget a quick edit whose version is gone, so the next render does not redo it,
+        // unless a kept quick edit was made on top of it.
+        const gone = `outbox/${file}`;
+        rec.quickEdits = rec.quickEdits.filter((l) => !l.endsWith(`saved as ${gone}`) || rec.quickEdits.some((o) => o.includes(`of ${gone}`)));
+        saveProject(rec);
+      }
       if (people.length) writeJson(peopleFile, readPeople().filter((x) => !people.includes(x.id)));
+      if (fontsGone.length) { const l = readLook(); for (const n of fontsGone) delete l.fonts[n]; writeJson(brandLookFile, l); }
       pushState();
       return send(res, 200, { ok: true, count: targets.length + people.length });
     }
@@ -1268,7 +1601,7 @@ const server = createServer(async (req, res) => {
       if (!name) return send(res, 400, { error: 'Give the brand a name first.' });
       if (!existsSync(styleFile)) return send(res, 400, { error: 'There is no style to share yet.' });
       const q = (k) => url.searchParams.get(k) === '1';
-      await exportPack(res, { name, broll: q('broll'), music: q('music'), people: q('people') });
+      await exportPack(res, { name, broll: q('broll'), music: q('music'), images: q('images'), styles: q('styles'), people: q('people') });
       return;
     }
     if (path === '/api/brand/import' && req.method === 'PUT') {
@@ -1297,31 +1630,61 @@ const server = createServer(async (req, res) => {
 
     // One video from one or more clips. Several clips are parts (and retakes) of the same talk.
     if (path === '/api/edit' && req.method === 'POST') {
-      const { files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null } = await body(req);
+      const { files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null, style = '', music = '', sfx = true, assets = [], preview = false } = await body(req);
       const inInbox = (list) => [...new Set((Array.isArray(list) ? list : []).map(safePath))].filter((n) => n && existsSync(inboxFull(n)));
       const clips = inInbox(files).filter((n) => kindOf(n) === 'video');
       if (!clips.length) return send(res, 400, { error: 'Those clips are not in your inbox anymore.' });
       const title = String(videoName).trim().slice(0, 80) || basename(clips[0]).replace(/\.[^.]+$/, '');
       const slug = newSlug(String(videoName).trim() || basename(clips[0]));
       const choice = contact?.type === 'person' && readPeople().some((x) => x.id === contact.id) ? { type: 'person', id: contact.id } : { type: 'all' };
+      const learned = findStyle(style);
+      const styleUse = learned?.ready ? learned : null;
       const brollNames = inInbox(broll).filter((n) => !clips.includes(n));
       const extraNames = inInbox(extra);
       const list = (ns) => ns.map((n) => `inbox/${n}`).join(', ');
+      // Brand pictures and sounds the user attached, each with an optional "what it's for" note.
+      const soundPath = (rel) => { const p = safePath(rel); return p && existsSync(join(dirs.sounds, ...p.split('/'))) ? `my-sounds/${p}` : null; };
+      const assetLines = (Array.isArray(assets) ? assets : []).map((a) => {
+        const ref = String(a?.ref || '');
+        const note = String(a?.note || '').trim().slice(0, 200);
+        let path = null;
+        if (ref.startsWith('image:')) { const n = safeName(ref.slice(6)); if (n && kindOf(n) === 'image' && existsSync(join(imagesDir, n))) path = `my-brand/images/${n}`; }
+        else if (ref.startsWith('sound:')) path = soundPath(ref.slice(6));
+        return path ? `- ${path}${note ? ` — for: ${note}` : ''}` : null;
+      }).filter(Boolean);
+      // Background music: '' = editor decides (default), 'none' = no music, 'track:<path>' = use that track.
+      let musicLine = '';
+      const mus = String(music || '');
+      if (mus === 'none') musicLine = 'Do not add any background music to this video. Keep the voice (and any sound effects) only.';
+      else if (mus.startsWith('track:')) { const p = soundPath(mus.slice(6)); if (p) musicLine = `Use ${p} as the background music bed for this video, kept quiet under the voice.`; }
+      const sfxLine = sfx === false
+        ? 'Do not add any sound effects to this video.'
+        : 'Add sound effects so the video feels lively, even if the style says voice only: a whoosh, pop, ding or similar on cuts, ' +
+          'transitions, text cards, stickers and graphics, always quieter than the voice. Use effects from my-sounds/sfx/ (named by kind, like whoosh-2.wav) and any other sound in my-sounds/ under 15 seconds, when there are any; ' +
+          'otherwise make simple ones with FFmpeg.';
       const prompt = [
         `edit this: ${list(clips)}`,
         clips.length > 1 && (keepOrder
           ? `These ${clips.length} clips are parts of one video. Keep them in exactly this order, and drop retakes and false starts inside them.`
           : `These ${clips.length} clips are parts of one video, filmed as separate takes. Listen to all of them, put them in story order, and drop retakes and false starts. Copy each into assets/raw/ and keep the originals untouched.`),
-        `Use the slug "${slug}" exactly, and save the first draft as outbox/${slug}-v1.mp4.`,
+        preview === true
+          ? `Use the slug "${slug}" exactly. Preview first: follow "Preview first" in CLAUDE.md. Save the 5-second sample as outbox/${slug}-preview.mp4 ` +
+            `and the storyboard frames as outbox/${slug}-preview-01.jpg, -02.jpg, and so on. Do not render the full draft until I say it looks good.`
+          : `Use the slug "${slug}" exactly, and save the first draft as outbox/${slug}-v1.mp4.`,
         brollNames.length ? `These inbox clips are B-roll for this video: ${list(brollNames)}.` : '',
         extraNames.length ? `Also use these inbox files: ${list(extraNames)}.` : '',
+        assetLines.length ? `Use these brand assets in this video, each for the purpose noted:\n${assetLines.join('\n')}` : '',
+        musicLine,
+        sfxLine,
         contactPrompt(choice),
+        styleUse ? stylePrompt(styleUse.id) : '',
         String(instructions).trim() ? `Notes from me for this video: ${String(instructions).trim()}` : '',
       ].filter(Boolean).join('\n');
-      const reqObj = { id: randomUUID(), type: 'edit', slug, title, prompt };
+      const reqObj = { id: randomUUID(), type: 'edit', slug, title, prompt, styleId: styleUse?.id || null };
       saveProject({
-        slug, title, source: clips[0], sources: clips, broll: brollNames, contact: choice, contactLabel: contactLabel(choice), createdAt: Date.now(), updatedAt: Date.now(),
-        status: 'queued', sessionId: null, history: [],
+        slug, title, source: clips[0], sources: clips, broll: brollNames, contact: choice, contactLabel: contactLabel(choice),
+        style: styleUse?.id || null, styleName: styleUse?.name || null, createdAt: Date.now(), updatedAt: Date.now(),
+        status: 'queued', sessionId: null, history: [], previewFirst: preview === true,
       });
       const r = request(reqObj);
       if (r.error) { rmSync(projectFile(slug), { force: true }); return send(res, 409, r); }
@@ -1330,7 +1693,7 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { ok: true, slug, queued: Boolean(r.queued) });
     }
 
-    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(notes|final|horizontal|rename|retry)$/)) && req.method === 'POST') {
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(notes|final|horizontal|rename|retry|go)$/)) && req.method === 'POST') {
       const [, slug, action] = m;
       const p = listProjects().find((x) => x.slug === slug);
       if (!p) return send(res, 404, { error: 'Project not found.' });
@@ -1352,6 +1715,10 @@ const server = createServer(async (req, res) => {
         if (!text) return send(res, 400, { error: 'Write a note first.' });
         reqObj = { type: 'notes', slug, text, horizontal: Boolean(b.horizontal), watching: safeName(b.watching || '') || null };
         said = text;
+      } else if (action === 'go') {
+        if (!p.preview || p.versions.length) return send(res, 400, { error: 'There is no preview waiting for this video.' });
+        reqObj = { type: 'go', slug };
+        said = 'Looks good. Make the full edit.';
       } else if (action === 'final') {
         reqObj = { type: 'final', slug };
         said = 'Approved! Make the final version.';
@@ -1367,6 +1734,25 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { ok: true, queued: Boolean(r.queued) });
     }
 
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/cut$/)) && req.method === 'POST') {
+      const { from, start, end } = await body(req);
+      const r = await quickEdit(m[1], safeName(from || ''), { cut: [start, end] });
+      return send(res, r.error ? 409 : 200, r);
+    }
+    // The clip arrives as the request body and is kept in the project, where the AI can find it later.
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/insert$/)) && req.method === 'PUT') {
+      const name = safeName(url.searchParams.get('name')?.replace(/[\\/:*?"<>|]/g, '_'));
+      if (!name || kindOf(name) !== 'video') return send(res, 400, { error: 'That needs to be a video file.' });
+      if (!versionsBySlug().has(m[1])) return send(res, 404, { error: 'Project not found.' });
+      const dir = join(root, 'kit', 'video-projects', m[1], 'assets', 'added');
+      mkdirSync(dir, { recursive: true });
+      const clip = join(dir, freeName(dir, name));
+      try { await pipeline(req, createWriteStream(clip)); } catch { rmSync(clip, { force: true }); return send(res, 500, { error: 'Could not save the clip. Is the disk full?' }); }
+      const r = await quickEdit(m[1], safeName(url.searchParams.get('from') || ''), { at: url.searchParams.get('at'), clip });
+      if (r.error) rmSync(clip, { force: true });
+      return send(res, r.error ? 409 : 200, r);
+    }
+
     if (path === '/api/stop' && req.method === 'POST') { stopJob(); return send(res, 200, { ok: true }); }
     if (path === '/api/queue/remove' && req.method === 'POST') {
       const { id } = await body(req);
@@ -1377,7 +1763,8 @@ const server = createServer(async (req, res) => {
     if ((m = path.match(/^\/api\/doc\/(style|rules)$/))) {
       const file = join(root, m[1] === 'style' ? 'my-style.md' : 'my-rules.md');
       if (req.method === 'GET') {
-        const extra = m[1] === 'style' ? { reply: readJson(join(data, 'style-reply.json'), null) } : {};
+        const reply = readJson(join(data, 'style-reply.json'), null);
+        const extra = m[1] === 'style' ? { reply: reply?.styleId ? null : reply } : {};
         return send(res, 200, { text: readText(file), ...extra });
       }
       if (req.method === 'PUT') {
@@ -1401,11 +1788,91 @@ const server = createServer(async (req, res) => {
     }
 
     if (path === '/api/style/ask' && req.method === 'POST') {
-      if (locked()) return send(res, 423, { error: 'Your style comes from your brand pack, so it cannot be changed here.' });
-      const { text } = await body(req);
+      const { text, styleId = null } = await body(req);
+      const st = styleId ? findStyle(styleId) : null;
+      if (styleId && !st?.ready) return send(res, 404, { error: 'That style is not here anymore.' });
+      if (!st && locked()) return send(res, 423, { error: 'Your style comes from your brand pack, so it cannot be changed here.' });
       if (!String(text || '').trim()) return send(res, 400, { error: 'Describe the change first.' });
-      const r = request({ type: 'style', title: 'Your style', text: String(text).trim() });
+      const r = request({ type: 'style', styleId: st?.id || null, title: st ? st.name : 'Your style', text: String(text).trim() });
       return send(res, r.error ? 409 : 200, r);
+    }
+
+    if (path === '/api/style/rename' && req.method === 'POST') {
+      const s = getSettings();
+      s.mainStyleName = clean((await body(req)).name, 60);
+      writeJson(settingsFile, s);
+      pushState();
+      return send(res, 200, { ok: true });
+    }
+
+    // A sample video becomes a new named style: save it in my-styles/<id>/, then the editor studies it.
+    if (path === '/api/styles/learn' && req.method === 'PUT') {
+      const name = clean(url.searchParams.get('name'), 60);
+      const ext = extname(String(url.searchParams.get('file') || '')).toLowerCase();
+      if (!name) return send(res, 400, { error: 'Give the style a name first.' });
+      if (!VIDEO.has(ext)) return send(res, 400, { error: 'That needs to be a video (MP4 or MOV).' });
+      const id = newStyleId(name);
+      mkdirSync(styleDir(id), { recursive: true });
+      const tmp = join(styleDir(id), `.uploading-${randomUUID()}`);
+      try { await pipeline(req, createWriteStream(tmp)); } catch {
+        rmSync(styleDir(id), { recursive: true, force: true });
+        return send(res, 500, { error: 'Could not save the video. Is the disk full?' });
+      }
+      renameSync(tmp, join(styleDir(id), `source${ext}`));
+      writeJson(join(styleDir(id), 'meta.json'), { name, createdAt: Date.now() });
+      const r = request({ type: 'learn', styleId: id, title: `Learning “${name}”` });
+      pushState();
+      return send(res, r.error ? 409 : 200, { ...r, id });
+    }
+    if ((m = path.match(/^\/api\/styles\/([a-z0-9-]+)(?:\/(rename|retry|duplicate))?$/))) {
+      const st = findStyle(m[1]);
+      if (!st) return send(res, 404, { error: 'That style is not here anymore.' });
+      const busyHere = job?.styleId === st.id || queue.some((q) => q.styleId === st.id);
+      if (!m[2] && req.method === 'GET') {
+        const reply = readJson(join(data, 'style-reply.json'), null);
+        return send(res, 200, { text: readText(join(styleDir(st.id), 'style.md')), reply: reply?.styleId === st.id ? reply : null });
+      }
+      if (m[2] === 'rename' && req.method === 'POST') {
+        const name = clean((await body(req)).name, 60);
+        if (!name) return send(res, 400, { error: 'Give the style a name.' });
+        if (busyHere) return send(res, 409, { error: 'Wait until the editor is done with this style.' });
+        const f = join(styleDir(st.id), 'meta.json');
+        writeJson(f, { ...readJson(f, {}), name });
+        const doc = join(styleDir(st.id), 'style.md');
+        const text = readText(doc);
+        if (text) writeFileSync(doc, text.replace(/^# .*$/m, `# ${name}`));
+        pushState();
+        return send(res, 200, { ok: true });
+      }
+      // A full copy (sample video and storyboard too) under a new name, so it works as a backup.
+      // A branded copy then has the editor swap its colors, gradients and fonts for the brand look.
+      if (m[2] === 'duplicate' && req.method === 'POST') {
+        if (busyHere) return send(res, 409, { error: 'Wait until the editor is done with this style.' });
+        const branded = Boolean((await body(req)).branded);
+        if (branded && !lookReady()) return send(res, 400, { error: 'Add your brand colors or fonts in My brand first.' });
+        const name = clean(`${st.name.slice(0, 51)} (${branded ? 'brand' : 'copy'})`, 60);
+        const id = newStyleId(name);
+        try {
+          cpSync(styleDir(st.id), styleDir(id), { recursive: true });
+        } catch {
+          rmSync(styleDir(id), { recursive: true, force: true });
+          return send(res, 500, { error: 'Could not copy the style. Is the disk full?' });
+        }
+        const f = join(styleDir(id), 'meta.json');
+        writeJson(f, { ...readJson(f, {}), name, createdAt: Date.now() });
+        const doc = join(styleDir(id), 'style.md');
+        const text = readText(doc);
+        if (text) writeFileSync(doc, text.replace(/^# .*$/m, `# ${name}`));
+        const r = branded ? request({ type: 'style', styleId: id, title: name, text: 'Brand this copied style. Follow "Branding a copied style" in CLAUDE.md.' }) : {};
+        pushState();
+        return send(res, 200, { ok: true, id, name, queued: r.queued, ahead: r.ahead });
+      }
+      if (m[2] === 'retry' && req.method === 'POST') {
+        if (busyHere) return send(res, 409, { error: 'The editor is already on this style.' });
+        const r = request({ type: 'learn', styleId: st.id, title: `Learning “${st.name}”` });
+        pushState();
+        return send(res, r.error ? 409 : 200, r);
+      }
     }
 
     if (path === '/api/setup/run' && req.method === 'POST') { const r = runSetup(); return send(res, r.error ? 409 : 200, r); }
@@ -1421,6 +1888,7 @@ const server = createServer(async (req, res) => {
       const s = getSettings();
       if (PERMISSION_MODES.includes(b.permissionMode)) s.permissionMode = b.permissionMode;
       if (MODELS.includes(b.model)) s.model = b.model;
+      if (typeof b.brandCheck === 'boolean') s.brandCheck = b.brandCheck;
       writeJson(settingsFile, s);
       pushState();
       return send(res, 200, { ok: true });
@@ -1453,7 +1921,7 @@ const server = createServer(async (req, res) => {
 });
 
 // Live updates when files change outside the app (Finder, terminal Claude).
-for (const dir of [dirs.outbox, dirs.sounds, dirs.brand, brollDir]) {
+for (const dir of [dirs.outbox, dirs.sounds, dirs.brand, brollDir, dirs.styles]) {
   try { watch(dir, () => pushState()); } catch {}
 }
 try { watch(dirs.inbox, { recursive: true }, () => pushState()); } catch { try { watch(dirs.inbox, () => pushState()); } catch {} }

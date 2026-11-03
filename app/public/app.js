@@ -14,6 +14,8 @@ const S = {
   setupLog: null,
   sel: {},          // selected version per project
   noteTarget: {},   // 'vertical' | 'horizontal' per project
+  cut: {},          // { file, from, to, dur, busy, preview } per project while a cut is being marked
+  clipAt: null,     // { slug, at, file } while picking a clip to put in
   pick: [],         // inbox clips picked for the next video, in the order they were picked
   dialog: null,     // { files, keep } while the new-video dialog is open
   brandPick: null,  // { slot, category } for the brand file picker
@@ -21,7 +23,7 @@ const S = {
   styleMode: 'read',
   rulesMode: 'read',
   wizard: { step: 0, answers: {} },
-  docs: { style: undefined, rules: undefined, brandRules: undefined, styleReply: null },
+  docs: { style: undefined, rules: undefined, brandRules: undefined, styleReply: null, learned: undefined },
 };
 
 // ---------- icons (Phosphor, see icons.js) ----------
@@ -33,12 +35,13 @@ const I = {
   edit: icon('pencil-simple-line'), style: icon('pencil-simple'), brand: icon('storefront'), pack: icon('package'),
   lock: icon('lock-simple'), clock: icon('clock'), retry: icon('arrow-clockwise'), wrench: icon('wrench'), plus: icon('plus'),
   trash: icon('trash'), left: icon('arrow-left'), right: icon('arrow-right'), id: icon('identification-card'), share: icon('export'),
-  importIco: icon('tray-arrow-down'), queue: icon('queue'), soundOn: icon('speaker-high'), soundOff: icon('speaker-slash'),
+  importIco: icon('tray-arrow-down'), queue: icon('queue'), soundOn: icon('speaker-high'), soundOff: icon('speaker-slash'), copy: icon('copy'),
 };
 for (const el of document.querySelectorAll('i[data-icon]')) el.outerHTML = icon(el.dataset.icon);
 const kindIcon = (k) => ({ video: I.film, image: I.image, text: I.text, audio: I.music })[k] || I.text;
 
 // ---------- formatting ----------
+const fmtClock = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
 const fmtDur = (s) => { if (!s) return ''; s = Math.round(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
 const fmtSize = (b) => (b > 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b > 1e6 ? `${Math.round(b / 1e6)} MB` : `${Math.max(1, Math.round(b / 1e3))} KB`);
 const ago = (t) => {
@@ -53,7 +56,15 @@ const elapsed = (since) => { const s = Math.max(0, Math.round((Date.now() - sinc
 const tapeLabel = (l) => l === 'final' ? 'Final' : l === 'horizontal-final' ? 'YouTube final' : l.startsWith('horizontal-') ? `YouTube ${l.slice(11)}` : l;
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const prettyCat = (c) => c.replace(/-/g, ' ').replace(/^\w/, (x) => x.toUpperCase());
-const JOB_LABEL = { edit: 'New video', notes: 'Notes', final: 'Final version', horizontal: 'YouTube version', style: 'Style update', setup: 'Setup' };
+// Sound effects live in my-sounds/sfx as <kind>-<n>.*, kept apart from the music list.
+function sfxSummary() {
+  const sfx = S.state.sfx || [];
+  if (!sfx.length) return '';
+  const kinds = [...new Set(sfx.map((f) => f.name.replace(/(-\d+)?\.\w+$/, '')))].sort();
+  return `<p class="small muted" style="margin-top:12px">${plural(sfx.length, 'sound effect')} in ${plural(kinds.length, 'kind')}: ${esc(kinds.map((k) => k.replace(/-/g, ' ')).join(', '))}. The editor picks from them.
+    <button class="btn quiet sm" data-action="reveal" data-area="sounds" data-folder="${esc(sfx[0].folder)}" data-name="${esc(sfx[0].name)}">Show in folder</button></p>`;
+}
+const JOB_LABEL = { edit: 'New video', go: 'Full edit', notes: 'Notes', final: 'Final version', horizontal: 'YouTube version', style: 'Style update', learn: 'Learning a style', setup: 'Setup' };
 
 // Small markdown: headings, lists, tables, quotes, code, bold, italics, links.
 const inline = (t) => esc(t)
@@ -138,18 +149,21 @@ function connect() {
 }
 
 function onDone(d) {
-  if (d.kind === 'style') {
+  if (d.kind === 'style' && !d.styleId) {
     S.docs.style = undefined; S.docs.styleReply = { text: d.text, error: d.error };
     if (route().name === 'style') loadDoc('style');
   }
+  if ((d.kind === 'style' || d.kind === 'learn') && d.styleId && route().name === 'style' && route().arg === d.styleId) loadLearned(d.styleId);
+  const styleName = S.state?.styles.find((x) => x.id === d.styleId)?.name || 'The new style';
   const proj = S.state?.projects.find((p) => p.slug === d.slug);
   const name = proj?.title || 'Your video';
-  if (d.kind === 'setup') toast(d.error ? 'Setup ran into a problem. Open Setup to read why.' : 'Setup check finished.', { bad: d.error, link: { href: '#/setup', label: 'Open' }, ms: 9000 });
+  if (d.kind === 'learn') toast(d.error || d.text?.startsWith('Stopped') ? `${styleName}: learning did not finish.` : `${styleName} is ready to use.`, { bad: d.error, link: { href: `#/style/${enc(d.styleId)}`, label: 'See it' }, ms: 9000 });
+  else if (d.kind === 'setup') toast(d.error ? 'Setup ran into a problem. Open Setup to read why.' : 'Setup check finished.', { bad: d.error, link: { href: '#/setup', label: 'Open' }, ms: 9000 });
   else if (d.error) toast(`${name}: the editor ran into a problem. Open it to see what happened.`, { bad: true, link: d.slug ? { href: `#/p/${d.slug}`, label: 'Open' } : null, ms: 10000 });
   else if (d.text?.startsWith('Stopped')) toast('Stopped.');
   else if (d.kind !== 'style' && !d.newVersion) toast(`The editor replied about ${name}.`, { link: d.slug ? { href: `#/p/${d.slug}`, label: 'Read' } : null, ms: 9000 });
   else if (d.kind !== 'style') toast(`${name} is ready to watch.`, { link: d.slug ? { href: `#/p/${d.slug}`, label: 'Watch' } : null, ms: 9000 });
-  else toast('Your style was updated.');
+  else toast(d.styleId ? `${styleName} was updated.` : 'Your style was updated.');
   if (d.ruleSaved) { S.docs.rules = undefined; toast('A note was saved as a lasting rule.', { link: { href: '#/rules', label: 'See rules' }, ms: 9000 }); }
   if (d.slug) delete S.sel[d.slug]; // jump to the newest version
   if (document.hidden && 'Notification' in window && Notification.permission === 'granted') {
@@ -169,7 +183,7 @@ const regionCache = new Map();
 function refresh() {
   if (!S.state) return;
   // The page files update on disk right away, but a server started before an update sends older data.
-  if (!S.state.brand || !S.state.queue) {
+  if (!S.state.brand || !S.state.queue || !S.state.styles || !('outdated' in S.state) || S.state.outdated) {
     current = { key: 'outdated', view: null };
     $('#main').innerHTML = `<div class="banner alert">${I.warn}<div><strong>The app was updated. Restart it to finish.</strong>
       <span class="muted">Close the black app window (or press Ctrl+C in it), then double-click Open Editor again.</span></div></div>`;
@@ -206,7 +220,7 @@ const rendererOk = (s) => s.chrome || s.testVideo;
 const setupReady = (s) => s.node && s.git && s.ffmpeg && s.claude && s.kit && rendererOk(s) && (s.groq || s.localWhisper);
 const busy = () => Boolean(S.job);
 const win = () => S.state?.setup.platform === 'win32';
-const jobHref = (j) => (j.slug ? `#/p/${enc(j.slug)}` : j.kind === 'style' ? '#/style' : '#/setup');
+const jobHref = (j) => (j.slug ? `#/p/${enc(j.slug)}` : j.styleId ? `#/style/${enc(j.styleId)}` : j.kind === 'style' ? '#/style/main' : '#/setup');
 const queueOf = (slug) => S.state.queue.findIndex((q) => q.slug === slug);
 
 const GLOBAL = {
@@ -258,7 +272,7 @@ function setupBanners() {
     const list = missing.join(', ').replace(/, ([^,]*)$/, ' and $1');
     out += `<div class="banner alert">${I.warn}<div><strong>Finish setting up first</strong><span class="muted">${esc(list.charAt(0).toUpperCase() + list.slice(1))} ${missing.length > 1 ? 'are' : 'is'} not set up yet.</span></div><a class="btn primary" href="#/setup">Go to setup</a></div>`;
   } else if (!s.style) {
-    out += `<div class="banner">${I.style}<div><strong>Pick your style</strong><span class="muted">Import your team's brand pack, or answer a few quick questions. About 2 minutes.</span></div><a class="btn primary" href="#/style">Set my style</a></div>`;
+    out += `<div class="banner">${I.style}<div><strong>Pick your style</strong><span class="muted">Import your team's brand pack, or answer a few quick questions. About 2 minutes.</span></div><a class="btn primary" href="#/style/main">Set my style</a></div>`;
   }
   return out;
 }
@@ -377,9 +391,11 @@ VIEWS.studio = {
       const tile = (fo) => {
         const clips = videosIn(fo.name);
         const covers = clips.slice(0, 3);
-        return `<a class="folder" href="#/f/${enc(fo.name)}" data-drop-folder="${esc(fo.name)}">
+        const files = S.state.inbox.filter((f) => f.folder === fo.name).length;
+        return `<div class="folder-tile"><a class="folder" href="#/f/${enc(fo.name)}" data-drop-folder="${esc(fo.name)}">
           <span class="covers">${covers.length ? covers.map((c) => `<img src="${clipThumb(c)}" alt="" loading="lazy" decoding="async">`).join('') : `<span class="nofile">${I.folder}</span>`}</span>
-          <span class="fname">${esc(fo.name)}</span><span class="meta">${clips.length ? plural(clips.length, 'clip') : 'Empty'} · ${ago(fo.mtime)}</span></a>`;
+          <span class="fname">${esc(fo.name)}</span><span class="meta">${clips.length ? plural(clips.length, 'clip') : 'Empty'} · ${ago(fo.mtime)}</span></a>
+          ${delBtn([{ area: 'inbox', path: fo.name }], files ? `the folder “${fo.name}” and its ${plural(files, 'file')}` : `the folder “${fo.name}”`, { cls: 'card-del' })}</div>`;
       };
       const form = S.newFolder ? `<form class="folder new" data-form="new-folder"><label class="sr" for="new-folder">Folder name</label>
           <input type="text" id="new-folder" maxlength="60" placeholder="e.g. Promo for October" autocomplete="off">
@@ -500,6 +516,7 @@ VIEWS.project = {
       <div class="stage">
         <div class="tapes" data-region="tapes" role="group" aria-label="Versions"></div>
         <div class="monitor" data-region="player"></div>
+        <div data-region="pv"></div>
         <div class="under-player" data-region="under"></div>
         <div data-region="notdone"></div>
       </div>
@@ -533,7 +550,7 @@ VIEWS.project = {
             <button class="btn primary" type="submit">Save name</button><button class="btn quiet" type="button" data-action="rename-cancel">Cancel</button></form>`
         : `<div class="title"><h1>${esc(p.title)}</h1><button class="btn quiet sm icon" data-action="rename" data-slug="${esc(slug)}" aria-label="Rename this video" title="Rename">${I.edit}</button></div>`;
       const src = p.sources.length > 1 ? `From ${plural(p.sources.length, 'clip')} · ` : p.sources.length ? `From ${esc(p.sources[0].split('/').pop())} · ` : '';
-      const forWho = p.contactLabel ? `${esc(p.contactLabel)} · ` : '';
+      const forWho = `${p.contactLabel ? `${esc(p.contactLabel)} · ` : ''}${p.styleName ? `${esc(p.styleName)} style · ` : ''}`;
       const del = S.job?.slug === slug || p.status === 'queued' ? '' : delBtn([{ area: 'project', path: slug }], `the video “${p.title}” and all its versions`, { label: 'Delete video' });
       return `${title}<div class="row spread"><p class="muted">${forWho}${src}${p.fromTerminal ? 'Edited in Claude · ' : ''}updated ${ago(p.updatedAt)}</p>${del}</div>`;
     },
@@ -547,6 +564,9 @@ VIEWS.project = {
       const p = proj(slug);
       const v = p && selected(p);
       if (v) return `<video controls playsinline preload="metadata" src="/media/outbox/${enc(v.file)}?t=${Math.round(v.mtime)}" poster="/thumb/outbox/${enc(v.file)}?t=${Math.round(v.mtime)}"></video>`;
+      const pv = p?.preview;
+      if (pv?.video && S.job?.slug !== slug) return `<video controls playsinline preload="metadata" src="/media/outbox/${enc(pv.video)}?t=${Math.round(pv.mtime)}" poster="/thumb/outbox/${enc(pv.video)}?t=${Math.round(pv.mtime)}"></video>`;
+      if (S.job?.slug === slug && p?.previewFirst && S.job.kind !== 'go') return `<div class="waiting"><span class="live"></span><b>Your preview is on its way.</b><span>A storyboard and a 5-second sample, so you can check the look before the full edit.</span></div>`;
       if (S.job?.slug === slug) return `<div class="waiting"><span class="live"></span><b>Your first draft is on its way.</b><span>Most videos take 10 to 30 minutes. You can leave this page; you'll get a notice when it's ready.</span></div>`;
       if (p?.status === 'queued') return `<div class="waiting"><b>Waiting in line.</b><span>The editor starts this as soon as it finishes what it's doing.</span></div>`;
       return `<div class="waiting"><b>No video yet.</b><span>${p?.status === 'error' || p?.status === 'interrupted' ? 'The last run did not finish. See the reply on the right.' : ''}</span></div>`;
@@ -554,9 +574,34 @@ VIEWS.project = {
     under: (slug) => {
       const p = proj(slug);
       const v = p && selected(p);
-      return `${v ? `<a class="btn quiet sm" href="/media/outbox/${enc(v.file)}" download="${esc(v.file)}">${I.down} Download</a>
-        <button class="btn quiet sm" data-action="reveal" data-area="outbox" data-name="${esc(v.file)}">${I.folder} Show in folder</button>` : ''}
+      const cut = S.cut[slug];
+      const handle = (end, label) => `<input type="range" class="cut-handle" data-cut-handle="${end}" min="0" max="${cut.dur.toFixed(2)}" step="0.05" value="${cut[end].toFixed(2)}" aria-label="${label}"${cut.busy ? ' disabled' : ''}>`;
+      const quick = v && S.job?.slug !== slug && p.status !== 'queued' && !/final$/.test(v.label) ? `<div class="quick">
+        ${cut ? `<div class="cutter">
+          <p class="small">Drag the red handles to the start and end of the part to remove. The video shows where each handle is.</p>
+          <div class="cut-bar" style="--from:${cut.from / cut.dur};--to:${cut.to / cut.dur}"><div class="cut-range"></div><div class="cut-head"></div>${handle('from', 'Cut starts at')}${handle('to', 'Cut ends at')}</div>
+          <div class="row spread"><span class="small" data-cut-label>${cutLabel(cut)}</span><span class="row">
+            ${cut.busy ? `<button class="btn sm primary" disabled>Cutting… about half a minute</button>` : `<button class="btn quiet sm" data-action="cut-cancel" data-slug="${esc(slug)}">Cancel</button>
+            <button class="btn sm" data-action="cut-preview" data-slug="${esc(slug)}" title="Plays the video as if this part were already gone">${I.play} Preview</button>
+            <button class="btn sm primary" data-action="cut-end" data-slug="${esc(slug)}">${I.x} Cut it</button>`}</span></div></div>`
+        : `<button class="btn sm" data-action="cut-start" data-slug="${esc(slug)}" title="Mark a part of this version to remove">${I.x} Cut a part out</button>
+          <button class="btn sm" data-action="add-clip" data-slug="${esc(slug)}" title="Pause where the clip should go">${I.film} Add a clip here</button>
+          <span class="muted small">Made on this computer in seconds. No AI used.</span>`}</div>` : '';
+      return `${quick}${v ? `<a class="btn quiet sm" href="/media/outbox/${enc(v.file)}" download="${esc(v.file)}">${I.down} Download</a>
+        <button class="btn quiet sm" data-action="reveal" data-area="outbox" data-name="${esc(v.file)}">${I.folder} Show in folder</button>
+        ${S.job?.slug === slug || p.status === 'queued' ? '' : delBtn([{ area: 'version', path: v.file }], `version ${tapeLabel(v.label)}`, { label: 'Delete this version' })}` : ''}
         <button class="btn quiet sm" data-action="reveal" data-area="kit" data-name="${esc(slug)}" title="The editable project files">${I.folder} Project files</button>`;
+    },
+    pv: (slug) => {
+      const p = proj(slug);
+      const pv = p?.preview;
+      if (!pv || p.versions.length || S.job?.slug === slug || p.status === 'queued') return '';
+      return `<section class="panel preview-panel">
+        <div class="panel-head"><h2 class="sub">${I.film} Preview</h2><span class="muted small">Nothing full-length is made until you say so.</span></div>
+        ${pv.frames.length ? `<div class="board">${pv.frames.map((f, i) => `<figure class="frame"><a href="/media/outbox/${enc(f)}?t=${Math.round(pv.mtime)}" target="_blank" rel="noopener"><img src="/media/outbox/${enc(f)}?t=${Math.round(pv.mtime)}" alt="Storyboard frame ${i + 1}" loading="lazy" decoding="async"></a></figure>`).join('')}</div>` : ''}
+        <div class="row"><button class="btn primary" data-action="go" data-slug="${esc(slug)}">${I.check} Looks good, make the full edit</button>
+          <span class="muted small">Not right? Write what to change below and the editor makes a new preview.</span></div>
+      </section>`;
     },
     notdone: (slug) => {
       const p = proj(slug);
@@ -573,7 +618,7 @@ VIEWS.project = {
       const p = proj(slug);
       const j = S.job;
       if (j && j.slug === slug) {
-        return progressPanel(j, { edit: 'Editing your video', final: 'Making the final version', horizontal: 'Making the YouTube version' }[j.kind] || 'Working on your notes');
+        return progressPanel(j, { edit: p?.previewFirst ? 'Making your preview' : 'Editing your video', go: 'Building the full edit', final: 'Making the final version', horizontal: 'Making the YouTube version' }[j.kind] || 'Working on your notes');
       }
       const q = S.state.queue.filter((x) => x.slug === slug);
       if (!q.length) return '';
@@ -607,12 +652,14 @@ VIEWS.project = {
       if (S.job && S.job.slug !== slug) return `The editor is busy with “${esc(S.job.title)}”. Your notes wait in line.`;
       if (S.job) return 'The editor is on this video now. New notes start right after.';
       const p = proj(slug);
+      if (p?.preview && !p.versions.length) return 'Makes a new preview.';
       const n = p ? p.versions.filter((v) => /^v\d+$/.test(v.label)).length : 0;
       return n ? `Makes version ${n + 1}.` : '';
     },
   },
   after: (slug) => {
     const p = proj(slug);
+    cutTick();
     for (const b of $$('[data-action="send-note"], [data-action="final"], [data-action="horizontal"]')) b.disabled = !p;
     for (const b of $$('[data-action="final"], [data-action="horizontal"]')) if (p && !p.versions.length) b.disabled = true;
     const stamp = $('[data-action="stamp"]');
@@ -629,6 +676,44 @@ VIEWS.project = {
   },
 };
 const proj = (slug) => S.state.projects.find((p) => p.slug === slug);
+const cutLabel = (c) => `Removing <b class="num">${fmtClock(c.from)}</b> to <b class="num">${fmtClock(c.to)}</b> (${(c.to - c.from).toFixed(1)} seconds)`;
+const openCut = () => { const r = route(); return r.name === 'project' ? S.cut[r.arg] : null; };
+// While a cut is open: moves the playhead on the cut bar, and during Preview jumps over the red part.
+let cutLoop = false;
+function cutTick() {
+  if (cutLoop) return;
+  cutLoop = true;
+  const step = () => {
+    const c = openCut();
+    const v = $('.monitor video');
+    if (!c || !v) { cutLoop = false; return; }
+    $('.cut-bar')?.style.setProperty('--head', v.currentTime / c.dur);
+    if (c.preview) {
+      if (v.paused) c.preview = false;
+      else if (v.currentTime >= c.from && v.currentTime < c.to) v.currentTime = c.to;
+      else if (v.currentTime >= c.to + 2) { v.pause(); c.preview = false; }
+    }
+    requestAnimationFrame(step);
+  };
+  step();
+}
+// Dragging a cut handle: show that frame, and keep start before end.
+document.addEventListener('input', (e) => {
+  const h = e.target.closest?.('[data-cut-handle]');
+  const c = h && openCut();
+  if (!c) return;
+  const t = Number(h.value);
+  if (h.dataset.cutHandle === 'from') c.from = Math.min(t, c.to - 0.1);
+  else c.to = Math.max(t, c.from + 0.1);
+  h.value = c[h.dataset.cutHandle];
+  c.preview = false;
+  const v = $('.monitor video');
+  if (v) { v.pause(); v.currentTime = c[h.dataset.cutHandle]; }
+  const bar = $('.cut-bar');
+  bar.style.setProperty('--from', c.from / c.dur);
+  bar.style.setProperty('--to', c.to / c.dur);
+  $('[data-cut-label]').innerHTML = cutLabel(c);
+});
 function selected(p) {
   const file = S.sel[p.slug];
   return p.versions.find((v) => v.file === file) || [...p.versions].sort((a, b) => b.mtime - a.mtime)[0];
@@ -666,16 +751,35 @@ const lineRow = (l = { label: '', value: '' }) => `<div class="line">
   <input type="text" name="value" value="${esc(l.value)}" placeholder="e.g. 0945-684-1899" aria-label="Number or text">
   <button type="button" class="btn quiet icon" data-action="remove-line" aria-label="Remove this line">${I.x}</button></div>`;
 
+const colorRow = (c = { label: '', hex: '#000000' }) => `<div class="line color-row">
+  <input type="color" name="hex" value="${esc(c.hex)}" aria-label="Color">
+  <input type="text" name="label" value="${esc(c.label)}" placeholder="e.g. Main gold, Text white" maxlength="40" aria-label="What this color is for">
+  <button type="button" class="btn quiet icon" data-action="remove-line" aria-label="Remove this color">${I.x}</button></div>`;
+const ANGLES = [[180, 'Top to bottom'], [90, 'Left to right'], [135, 'Diagonal ↘'], [45, 'Diagonal ↗']];
+const gradientRow = (g = { label: '', from: '#000000', to: '#ffffff', angle: 180 }) => `<div class="line gradient-row">
+  <span class="swatch" style="background:linear-gradient(${Number(g.angle)}deg, ${esc(g.from)}, ${esc(g.to)})" aria-hidden="true"></span>
+  <input type="color" name="from" value="${esc(g.from)}" aria-label="Start color">
+  <input type="color" name="to" value="${esc(g.to)}" aria-label="End color">
+  <select name="angle" aria-label="Direction">${ANGLES.map(([v, l]) => `<option value="${v}" ${Number(g.angle) === v ? 'selected' : ''}>${l}</option>`).join('')}</select>
+  <input type="text" name="label" value="${esc(g.label)}" placeholder="e.g. Caption bars" maxlength="40" aria-label="What this gradient is for">
+  <button type="button" class="btn quiet icon" data-action="remove-line" aria-label="Remove this gradient">${I.x}</button></div>`;
+
 VIEWS.brand = {
   layout: () => `
     <div class="page-head"><div><h1>My brand</h1><p>The things every video for your brand uses. Add them once and the editor picks them up on every edit.</p></div><div data-region="packTag"></div></div>
     <div data-region="needs"></div>
     <div class="slots"><section class="panel" data-region="logo"></section><section class="panel" data-region="social"></section></div>
+    <section class="section" id="brand-look">
+      <div class="section-head"><div><h2>Brand look</h2><p class="muted small">Your colors stay the same on every branded video. Fonts come from your shelf, so each style can still feel different. Use “Make a branded copy” on a learned style to put them on it.</p></div></div>
+      <div class="contact-grid"><section class="panel" data-region="look"></section><section class="panel" data-region="fonts"></section></div>
+      <section class="panel about" data-region="about"></section>
+    </section>
     <section class="section" id="brand-details">
       <div class="section-head"><div><h2>Contact part</h2><p class="muted small">The end of each video shows either the brand contact (for all sales) or one sales person. You choose when you start a video.</p></div></div>
       <div class="contact-grid"><section class="panel" data-region="bcontact"></section><section class="panel" data-region="people" id="brand-people"></section></div>
     </section>
     <section class="section" data-region="broll"></section>
+    <section class="section" data-region="images"></section>
     <section class="section" data-region="music"></section>
     <div class="section team"><section class="panel" data-region="share" id="brand-share"></section><section class="panel" data-region="import"></section></div>`,
   regions: {
@@ -695,6 +799,37 @@ VIEWS.brand = {
     },
     logo: () => brandSlot('logo'),
     social: () => brandSlot('social'),
+    look: () => {
+      const l = S.state.brand.look;
+      return `<h2 class="sub">${I.style} Colors and feel</h2>
+        <form class="details" data-form="look" autocomplete="off">
+          <div class="field"><span>Colors <span class="hint">(say what each is for)</span></span><div class="lines" data-lines="color">${(l.colors.length ? l.colors : [{ label: '', hex: '#000000' }]).map(colorRow).join('')}</div>
+            <button type="button" class="btn quiet sm" data-action="add-row" data-kind="color">${I.plus} Add a color</button></div>
+          <div class="field"><span>Gradients <span class="hint">(optional, for caption bars and cards)</span></span><div class="lines" data-lines="gradient">${l.gradients.map(gradientRow).join('')}</div>
+            <button type="button" class="btn quiet sm" data-action="add-row" data-kind="gradient">${I.plus} Add a gradient</button></div>
+          <label class="field"><span>The feel</span><textarea name="feel" rows="3" maxlength="2000" placeholder="e.g. Premium but friendly. Clean, lots of space. No cartoon stickers.">${esc(l.feel)}</textarea></label>
+          <div class="row spread"><span></span><button class="btn primary" type="submit">Save colors and feel</button></div>
+        </form>`;
+    },
+    fonts: () => {
+      const fonts = S.state.brand.look.fonts;
+      const face = (f, i) => `@font-face{font-family:"shelf-${i}";src:url("/media/brand/fonts/${enc(f.name)}?t=${Math.round(f.mtime)}");font-display:swap}`;
+      return `<div class="slot-head"><h2 class="sub">${I.text} Font shelf</h2></div>
+        <p class="muted small">Add 3 to 6 fonts you are happy to use, and give each a mood. Each style picks the one closest to its own feel. Write “Always” for a font every video must use.</p>
+        ${fonts.length ? `<style>${fonts.map(face).join('')}</style>
+        <form class="details" data-form="fonts" autocomplete="off"><ul class="font-shelf">${fonts.map((f, i) => `<li>
+          <span class="font-sample" style="font-family:'shelf-${i}',sans-serif" aria-hidden="true">Aa Bb 123</span>
+          <span class="who"><small>${esc(f.name)}</small><input type="text" name="mood" data-file="${esc(f.name)}" value="${esc(f.mood)}" placeholder="Mood, e.g. Big bold, Clean, Always" maxlength="40" aria-label="Mood for ${esc(f.name)}"></span>
+          ${delBtn([{ area: 'font', path: f.name }], `the font ${f.name}`, { cls: 'btn quiet icon sm danger' })}</li>`).join('')}</ul>
+          <div class="row spread"><button type="button" class="btn sm" data-action="brand-pick" data-slot="font">${I.up} Add fonts</button><button class="btn primary" type="submit">Save moods</button></div></form>`
+        : `<div class="row"><button type="button" class="btn sm" data-action="brand-pick" data-slot="font">${I.up} Add fonts</button><span class="muted small">TTF, OTF, WOFF or WOFF2 files</span></div>`}`;
+    },
+    about: () => `<h2 class="sub">${I.brand} About the company</h2>
+      <p class="muted small">Helps the editor write hook text, pick which words to highlight, word the ending, choose B-roll and spell names right. It never changes what you say in your recording.</p>
+      <form class="details" data-form="about" autocomplete="off">
+        <textarea name="about" rows="6" maxlength="6000" aria-label="About the company" placeholder="What you sell, who buys, where you are, what makes you different, your tagline, words to use or avoid. e.g. Used and brand-new cars in Cebu, 20 years. Families and first-time buyers. Tagline: …">${esc(S.state.brand.look.about)}</textarea>
+        <div class="row spread"><span></span><button class="btn primary" type="submit">Save about the company</button></div>
+      </form>`,
     bcontact: () => {
       const c = S.state.brand.contact || { name: '', lines: [] };
       const lines = c.lines?.length ? c.lines : [{ label: '', value: '' }];
@@ -717,6 +852,7 @@ VIEWS.brand = {
             <label class="field"><span>Title</span><select name="title">${[['MISS', 'Miss'], ['MS.', 'Ms.'], ["MA'AM", "Ma'am"], ['SIR', 'Sir'], ['MR.', 'Mr.'], ['', 'No title']].map(([v, l]) => `<option value="${esc(v)}" ${p.title === v ? 'selected' : ''}>${l}</option>`).join('')}</select></label>
             <label class="field"><span>Name</span><input type="text" name="name" value="${esc(p.name || '')}" placeholder="e.g. JHAY" maxlength="60" required></label>
           </div>
+          <label class="field"><span>Facebook page <span class="hint">(optional, shown at the end of their videos)</span></span><input type="text" name="fb" value="${esc(p.fb || '')}" placeholder="Page name as it should show, e.g. Jhay Gold Aces Cars" maxlength="200"></label>
           <fieldset class="field pron"><legend>The editor calls them</legend><div class="seg" role="group">${['she', 'he'].map((v) => `<label><input type="radio" name="pronoun" value="${v}" ${(p.pronoun || 'she') === v ? 'checked' : ''}><span>${v === 'she' ? 'She / her' : 'He / him'}</span></label>`).join('')}</div></fieldset>
           <div class="field"><span>Numbers and other lines</span><div class="lines" data-lines>${(p.lines?.length ? p.lines : [{ label: '', value: '' }, { label: '', value: '' }]).map(lineRow).join('')}</div></div>
           <div class="row spread"><button type="button" class="btn quiet sm" data-action="add-line">${I.plus} Add a line</button>
@@ -726,7 +862,7 @@ VIEWS.brand = {
         <p class="muted small">For a video about one person: “Look for MISS JHAY” and their own numbers.</p>
         ${people.length ? `<ul class="people">${people.map((p) => editing === p.id ? `<li class="editing">${form(p)}</li>` : `<li>
             <span class="avatar" aria-hidden="true">${esc((p.name || '?').charAt(0))}</span>
-            <span class="who"><b>${esc(p.onScreen)}</b><small>${esc(pron[p.pronoun])}${p.lines.length ? ` · ${p.lines.map((l) => esc(l.label)).join(' · ')}` : ' · no numbers'}</small></span>
+            <span class="who"><b>${esc(p.onScreen)}</b><small>${esc(pron[p.pronoun])}${p.lines.length ? ` · ${p.lines.map((l) => esc(l.label)).join(' · ')}` : ' · no numbers'}${p.fb ? ' · Facebook' : ''}</small></span>
             <button class="btn quiet sm" data-action="person-edit" data-id="${esc(p.id)}">Edit</button>
             ${delBtn([{ area: 'person', path: p.id }], p.onScreen, { cls: 'btn quiet icon sm danger' })}</li>`).join('')}</ul>` : ''}
         ${editing === 'new' ? form({ pronoun: 'she', title: 'MISS' }) : `<div class="row">
@@ -753,16 +889,28 @@ VIEWS.brand = {
         ${empty.length ? `<div class="cats-empty">${filled.length ? '<h3 class="small muted">Still empty</h3>' : ''}<div>${empty.map((c) => `<button class="cat-add" data-action="brand-pick" data-slot="broll" data-category="${esc(c)}">${I.plus}<span>${esc(prettyCat(c))}</span></button>`).join('')}</div></div>` : ''}</div>
         <form class="row newcat" data-form="newcat"><label class="sr" for="newcat">New group name</label><input type="text" id="newcat" placeholder="New group, e.g. drone shots" maxlength="30"><button class="btn sm" type="submit">${I.plus} Add group</button></form>`;
     },
+    images: () => {
+      const imgs = S.state.brand.images || [];
+      const tile = (x) => `<figure class="reel-tile"><img src="/media/brand/images/${enc(x.name)}?t=${Math.round(x.mtime)}" alt="${esc(x.name)}" loading="lazy" decoding="async">
+        ${delBtn([{ area: 'images', path: x.name }], `the picture ${x.name}`, { cls: 'del' })}</figure>`;
+      return `<div class="section-head" id="brand-images"><div><h2>Pictures</h2><p class="muted small">Logos, badges, product shots and other images. Pick the ones you want when you start a video.</p></div>
+          <div class="row"><span class="muted small">${imgs.length ? `${plural(imgs.length, 'picture')} · ${fmtSize(S.state.brand.sizes.images)}` : 'No pictures yet'}</span>
+          ${imgs.length > 1 ? delBtn(imgs.map((x) => ({ area: 'images', path: x.name })), `all ${plural(imgs.length, 'picture')}`, { label: 'Delete all' }) : ''}
+          <button class="btn sm" data-action="brand-pick" data-slot="image">${I.up} Add pictures</button></div></div>
+        ${imgs.length ? `<div class="reel">${imgs.map(tile).join('')}</div>` : '<div class="empty">No pictures yet.</div>'}`;
+    },
     music: () => {
       const sounds = S.state.sounds;
       return `<div class="section-head" id="brand-music"><div><h2>Music and sound effects</h2><p class="muted small">Only add sounds you have the right to use. Without any, the editor makes simple effects itself.</p></div>
           <div class="row">${sounds.length > 1 ? delBtn(sounds.map((f) => ({ area: 'sounds', path: f.folder ? `${f.folder}/${f.name}` : f.name })), `all ${plural(sounds.length, 'sound')}`, { label: 'Delete all' }) : ''}
           <button class="btn sm" data-action="pick-sound">${I.up} Add music or sounds</button></div></div>
-        ${sounds.length ? `<div class="extras">${sounds.map((f) => `<span class="chip-del"><button class="chip" data-action="reveal" data-area="sounds" data-name="${esc(f.name)}" data-folder="${esc(f.folder || '')}">${I.music}${esc(f.folder ? `${f.folder} / ` : '')}${esc(f.name)}</button>${delBtn([{ area: 'sounds', path: f.folder ? `${f.folder}/${f.name}` : f.name }], f.name, { cls: 'btn quiet icon sm' })}</span>`).join('')}</div>` : '<div class="empty">No music yet.</div>'}`;
+        ${sounds.length ? `<div class="extras">${sounds.map((f) => `<span class="chip-del"><button class="chip" data-action="reveal" data-area="sounds" data-name="${esc(f.name)}" data-folder="${esc(f.folder || '')}">${I.music}${esc(f.folder ? `${f.folder} / ` : '')}${esc(f.name)}</button>${delBtn([{ area: 'sounds', path: f.folder ? `${f.folder}/${f.name}` : f.name }], f.name, { cls: 'btn quiet icon sm' })}</span>`).join('')}</div>` : '<div class="empty">No music yet.</div>'}
+        ${sfxSummary()}`;
     },
     share: () => {
       const b = S.state.brand;
       const music = S.state.sounds.filter((f) => f.kind === 'audio').length;
+      const learned = S.state.styles.filter((x) => x.ready).length;
       if (!S.state.setup.style) return `<h2 class="sub">${I.share} Share with your team</h2><p class="muted small">Set your style first. Then you can send it to teammates as one file.</p>`;
       return `<h2 class="sub">${I.share} Share with your team</h2>
         <p class="muted small">Makes one file with your style, rules, logo, screenshot and brand contact. Teammates import it, and their videos look like yours.</p>
@@ -770,6 +918,8 @@ VIEWS.brand = {
           <label class="field"><span>Brand name</span><input type="text" name="name" value="${esc(b.pack?.name || '')}" placeholder="e.g. Gold Aces" maxlength="60" required></label>
           <label class="tick"><input type="checkbox" name="broll" ${b.broll.length ? 'checked' : 'disabled'}>Include B-roll<small>${b.broll.length ? fmtSize(b.sizes.broll) : 'none yet'}</small></label>
           <label class="tick"><input type="checkbox" name="music" ${music ? '' : 'disabled'}>Include music<small>${music ? fmtSize(b.sizes.music) : 'none yet'}</small></label>
+          <label class="tick"><input type="checkbox" name="images" ${b.images.length ? 'checked' : 'disabled'}>Include pictures<small>${b.images.length ? fmtSize(b.sizes.images) : 'none yet'}</small></label>
+          <label class="tick"><input type="checkbox" name="styles" ${learned ? 'checked' : 'disabled'}>Include learned styles<small>${learned ? plural(learned, 'style') : 'none yet'}</small></label>
           <label class="tick"><input type="checkbox" name="people" ${b.people.length ? '' : 'disabled'}>Include sales people<small>${b.people.length ? `${b.people.length} with their numbers` : 'none yet'}</small></label>
           <button class="btn primary" type="submit">${I.pack} Make brand pack</button>
         </form>`;
@@ -779,7 +929,7 @@ VIEWS.brand = {
       return `<h2 class="sub">${I.importIco} ${p ? 'Your brand pack' : 'Got a brand pack?'}</h2>
         <p class="muted small">${p
           ? `Using “${esc(p.name)}” since ${new Date(p.importedAt).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}. When your team sends a newer one, import it here.`
-          : 'Import the .brandpack file from your team. It sets your style, logo, screenshot, brand contact and B-roll. Your own rules and sales people stay.'}</p>
+          : 'Import the .brandpack file from your team. It sets your style, logo, screenshot, brand contact and B-roll, and adds the team’s pictures and learned styles. Your own rules and sales people stay.'}</p>
         <div class="row"><button class="btn" data-action="import-pack">${I.importIco} Import brand pack</button>
         ${p ? '<button class="btn quiet sm" data-action="unlock">Stop using the brand pack</button>' : ''}</div>`;
     },
@@ -814,16 +964,117 @@ async function loadDoc(which) {
   } catch (e) { fail(e); }
 }
 
+async function loadLearned(id) {
+  try {
+    const d = await api(`/api/styles/${enc(id)}`);
+    S.docs.learned = { id, ...d };
+    regionCache.clear(); refresh();
+  } catch (e) { fail(e); }
+}
+
+const styleOf = (id) => S.state.styles.find((x) => x.id === id);
+const mainStyleName = () => S.state.settings.mainStyleName || (S.state.brand.pack ? S.state.brand.pack.name : 'My style');
+// A style's name as a page title, with a pencil to rename it in place. id is 'main' or a learned style's id.
+const styleTitle = (id, name, canRename = true) => (S.renamingStyle
+  ? `<form class="rename" data-form="rename-style" data-id="${esc(id)}"><label class="sr" for="rename-style">Style name</label>
+      <input type="text" id="rename-style" value="${esc(name)}" maxlength="60" autocomplete="off">
+      <button class="btn primary" type="submit">Save name</button><button class="btn quiet" type="button" data-action="rename-style-cancel">Cancel</button></form>`
+  : `<div class="title"><h1>${esc(name)}</h1>${canRename ? `<button class="btn quiet sm icon" data-action="rename-style" aria-label="Rename this style" title="Rename">${I.edit}</button>` : ''}</div>`);
+const renameCardBtn = (id, name) => `<button class="btn quiet sm icon" data-action="rename-style-go" data-id="${esc(id)}" aria-label="Rename ${esc(name)}" title="Rename">${I.edit}</button>`;
+const learningNow = (st) => S.job?.kind === 'learn' && S.job.styleId === st.id;
+const learnQueued = (st) => S.state.queue.some((q) => q.type === 'learn' && q.styleId === st.id);
+const frameSrc = (st, f) => `/media/styles/${enc(st.id)}/${enc(f.file)}?t=${Math.round(f.mtime)}`;
+const atLabel = (f) => (f.at === null ? '' : fmtDur(f.at) || '0:00');
+
+// #/style lists every style, #/style/main is the main style (my-style.md), #/style/<id> a learned one.
 VIEWS.style = {
-  enter: () => { S.styleMode = 'read'; S.docs.style = undefined; loadDoc('style'); },
-  layout: () => `<div data-region="body"></div>`,
+  enter: (id) => {
+    S.styleMode = 'read';
+    S.renamingStyle = S.focusRenameStyle = Boolean(id) && S.renameOnEnter === id;
+    S.renameOnEnter = null;
+    if (id === 'main') { S.docs.style = undefined; loadDoc('style'); } else if (id) { S.docs.learned = undefined; loadLearned(id); }
+  },
+  layout: (id) => (!id ? `
+    <div class="page-head"><div><h1>My styles</h1><p>Each style is a way your videos can look. You pick one every time you start a video.</p></div></div>
+    <section class="section" data-region="slist"></section>
+    <section class="panel learn" data-region="learn"></section>`
+    : id === 'main' ? `<a class="back" href="#/style">${I.left} My styles</a><div data-region="body"></div>`
+    : `<a class="back" href="#/style">${I.left} My styles</a>
+    <div data-region="lhead"></div>
+    <div data-region="lstatus"></div>
+    <section class="section" data-region="board"></section>
+    <div data-region="ldoc"></div>`),
   regions: {
+    slist: () => {
+      const pack = S.state.brand.pack;
+      const has = S.state.setup.style;
+      const main = `<article class="card"><a class="cover" href="#/style/main" aria-label="Open your main style"><span class="thumb style-cover">${I.style}${pack ? `<span class="tape sm">From ${esc(pack.name)}</span>` : ''}</span></a>
+        <div class="body"><div><div class="name" title="${esc(mainStyleName())}">${esc(mainStyleName())}</div><div class="meta">${has ? 'Main style' : 'Not set yet'}</div></div>
+        <div class="row"><a class="btn sm" href="#/style/main">${has ? 'Open' : 'Set it up'}</a>${has ? renameCardBtn('main', mainStyleName()) : ''}</div></div></article>`;
+      const card = (st) => {
+        const cover = st.frames[0];
+        const tape = learningNow(st) ? '<span class="tape rec sm">Learning…</span>' : learnQueued(st) ? '<span class="tape pale sm">In line</span>'
+          : st.ready ? '' : '<span class="tape pale sm">Not finished</span>';
+        return `<article class="card"><a class="cover" href="#/style/${enc(st.id)}" aria-label="Open the style ${esc(st.name)}"><span class="thumb style-cover">${cover ? `<img src="${frameSrc(st, cover)}" alt="" loading="lazy" decoding="async">` : I.film}${tape}</span></a>
+          <div class="body"><div><div class="name" title="${esc(st.name)}">${esc(st.name)}</div><div class="meta">${st.ready ? `${plural(st.frames.length, 'frame')} · ` : ''}learned ${ago(st.createdAt)}</div></div>
+          <div class="row"><a class="btn sm" href="#/style/${enc(st.id)}">Open</a>${learningNow(st) || learnQueued(st) ? '' : renameCardBtn(st.id, st.name)}</div></div>
+          ${learningNow(st) || learnQueued(st) ? '' : delBtn([{ area: 'style', path: st.id }], `the style “${st.name}”`, { cls: 'card-del' })}</article>`;
+      };
+      return `<div class="grid">${main}${S.state.styles.map(card).join('')}</div>`;
+    },
+    learn: () => `<h2 class="sub">${I.star} Learn a style from a video</h2>
+      <p class="muted small">Upload a video edited the way you like. The editor studies every detail of the edit (captions, cuts, graphics, color and sound), writes it down as a new style, and keeps a storyboard of frames that show how your videos should look. It takes a few minutes. If the editor is busy, it waits in line.</p>
+      <form class="row learn-form" data-form="learn" autocomplete="off">
+        <label class="field"><span>Name this style</span><input type="text" id="learn-name" maxlength="60" placeholder="e.g. Fast promo, Calm testimonial" required></label>
+        <button class="btn primary" type="submit">${I.up} Choose the video</button>
+      </form>`,
+    lhead: (id) => {
+      const st = styleOf(id);
+      if (!st) return '<div class="page-head"><div><h1>Not found</h1><p>This style is not here anymore. <a href="#/style">Back to My styles</a></p></div></div>';
+      const busyHere = learningNow(st) || learnQueued(st) || (S.job?.kind === 'style' && S.job.styleId === st.id);
+      return `<div class="page-head folder-head"><div>${styleTitle(st.id, st.name, !busyHere)}<p>Learned from a sample video ${ago(st.createdAt)}. Pick it when you start a video.</p></div>
+        <div class="row">${busyHere ? '' : (st.ready ? `<button class="btn quiet sm" data-action="style-duplicate" data-id="${esc(st.id)}">${I.copy} Make a copy</button><button class="btn sm" data-action="style-duplicate" data-id="${esc(st.id)}" data-branded="1">${I.brand} Make a branded copy</button>` : '') + delBtn([{ area: 'style', path: st.id }], `the style “${st.name}”`, { label: 'Delete style' })}</div></div>`;
+    },
+    lstatus: (id) => {
+      const st = styleOf(id);
+      if (!st) return '';
+      if (learningNow(st)) return progressPanel(S.job, 'Learning this style');
+      if (learnQueued(st)) return `<section class="panel waitline"><h2 class="sub">${I.queue} Waiting in line</h2><p class="muted small">The editor studies this video as soon as it finishes what it's doing.</p></section>`;
+      if (st.ready) return '';
+      return `<section class="panel"><h2 class="sub">${I.warn} Learning did not finish</h2>
+        ${st.reply ? `<div class="msg editor${st.reply.error ? ' error' : ''}" style="max-width:none;margin:12px 0"><div class="who">Editor</div>${md(st.reply.text)}</div>` : '<p class="muted small" style="margin:8px 0 12px">It was stopped or the app was closed.</p>'}
+        <button class="btn" data-action="style-retry" data-id="${esc(st.id)}">${I.retry} Try again</button></section>`;
+    },
+    board: (id) => {
+      const st = styleOf(id);
+      if (!st?.frames.length) return '';
+      return `<div class="section-head"><div><h2>Storyboard</h2><p class="muted small">Frames from the sample video. Your videos in this style should look like these.</p></div></div>
+        <div class="board">${st.frames.map((f) => `<figure class="frame"><a href="${frameSrc(st, f)}" target="_blank" rel="noopener"><img src="${frameSrc(st, f)}" alt="Frame${atLabel(f) ? ` at ${atLabel(f)}` : ''} of the sample video" loading="lazy" decoding="async"></a>
+          <figcaption>${atLabel(f) ? `<span class="num">${atLabel(f)}</span> ` : ''}${esc(f.note)}</figcaption></figure>`).join('')}</div>`;
+    },
+    ldoc: (id) => {
+      const st = styleOf(id);
+      const doc = S.docs.learned;
+      if (!st || !st.ready) return st?.source ? `<section class="section"><h2 style="margin-bottom:12px">Sample video</h2><div class="monitor" style="max-width:420px"><video controls playsinline preload="metadata" src="/media/styles/${enc(st.id)}/${enc(st.source)}"></video></div></section>` : '';
+      if (doc?.id !== id) return SKELETON;
+      const styleBusy = (S.job?.kind === 'style' && S.job.styleId === id) || S.state.queue.some((q) => q.type === 'style' && q.styleId === id);
+      return `<div class="split"><article class="panel doc">${md(doc.text)}</article>
+        <aside>
+          <section class="panel composer"><h2 class="sub"><label for="style-ask">Change something</label></h2><p class="muted small">Describe it in your own words. The editor updates this style for you.</p>
+            <textarea id="style-ask" placeholder="e.g. Make the captions smaller"></textarea>
+            <button class="btn primary" data-action="style-ask" data-style="${esc(id)}" ${styleBusy ? 'disabled' : ''}>${styleBusy ? 'Updating…' : busy() ? 'Update this style (waits in line)' : 'Update this style'}</button>
+            ${doc.reply ? `<div class="msg editor${doc.reply.error ? ' error' : ''}" style="max-width:none"><div class="who">Editor</div>${md(doc.reply.text)}</div>` : ''}
+          </section>
+          ${st.reply && !st.reply.error ? `<section class="panel"><h2 class="sub">What stands out</h2><div class="doc small">${md(st.reply.text)}</div></section>` : ''}
+          ${st.source ? `<section class="panel"><h2 class="sub">Sample video</h2><div class="monitor" style="margin-top:10px"><video controls playsinline preload="metadata" src="/media/styles/${enc(st.id)}/${enc(st.source)}"></video></div></section>` : ''}
+        </aside></div>`;
+    },
     body: () => {
       const text = S.docs.style;
       const pack = S.state.brand.pack;
       if (text === undefined) return SKELETON;
       if (pack && text !== null) {
-        return `<div class="page-head"><div><h1>My style</h1><p>Your team's brand style. Every ${esc(pack.name)} video follows it, whoever films.</p></div><span class="tape">From ${esc(pack.name)}</span></div>
+        return `<div class="page-head folder-head"><div>${styleTitle('main', mainStyleName())}<p>Your team's brand style. Every ${esc(pack.name)} video follows it, whoever films.</p></div><span class="tape">From ${esc(pack.name)}</span></div>
           <div class="split"><article class="panel doc">${md(text)}</article>
           <aside>
             <section class="panel locked"><h2 class="sub">${I.lock} Set by your brand pack</h2>
@@ -837,7 +1088,7 @@ VIEWS.style = {
         <textarea class="editor-area" id="doc-text" aria-label="Style text">${esc(text)}</textarea>`;
       const reply = S.docs.styleReply;
       const styleBusy = S.job?.kind === 'style' || S.state.queue.some((q) => q.type === 'style');
-      return `<div class="page-head"><div><h1>My style</h1><p>How every video is edited. Notes you give on videos can also become <a href="#/rules">rules</a>, which win over this.</p></div></div>
+      return `<div class="page-head folder-head"><div>${styleTitle('main', mainStyleName())}<p>Your main style: how videos are edited unless you pick another one. Notes you give on videos can also become <a href="#/rules">rules</a>, which win over this.</p></div></div>
         <div class="split"><article class="panel doc">${md(text)}</article>
         <aside>
           <section class="panel composer"><h2 class="sub"><label for="style-ask">Change something</label></h2><p class="muted small">Describe it in your own words. The editor updates your style for you.</p>
@@ -852,6 +1103,7 @@ VIEWS.style = {
         </aside></div>`;
     },
   },
+  after: () => { const i = $('#rename-style'); if (i && S.focusRenameStyle) { S.focusRenameStyle = false; i.focus(); i.select(); } },
 };
 
 function wizardHtml(hasExisting) {
@@ -981,7 +1233,9 @@ VIEWS.setup = {
     settings: () => {
       const st = S.state.settings;
       return `<div class="panel" style="margin-top:12px">
-        <h3>How much freedom does the editor get?</h3>
+        <h3>Brand check</h3>
+        <label class="tick"><input type="checkbox" ${st.brandCheck ? 'checked' : ''} data-action="set-brand-check"><span><b>Check every draft against My brand.</b> Before you see a draft, the editor looks at a few frames and fixes colors, fonts, logo or contact details that are off. Takes a little longer and uses a bit more of your plan.</span></label>
+        <h3 style="margin-top:22px">How much freedom does the editor get?</h3>
         <div class="radios">
           <label class="tick"><input type="radio" name="perm" value="auto" ${st.permissionMode === 'auto' ? 'checked' : ''} data-action="set-perm"><span><b>Safe mode</b> (recommended). A safety check reviews each step and blocks anything risky.</span></label>
           <label class="tick"><input type="radio" name="perm" value="bypassPermissions" ${st.permissionMode === 'bypassPermissions' ? 'checked' : ''} data-action="set-perm"><span><b>Full access.</b> No checks. Use only if safe mode keeps blocking normal editing steps.</span></label>
@@ -1020,11 +1274,22 @@ function openEditDialog(files) {
   const others = S.state.inbox.filter((x) => x.kind === 'video' && !files.includes(x.path));
   const extras = S.state.inbox.filter((x) => x.kind !== 'video');
   const lib = S.state.brand.broll.length;
+  const brandImgs = S.state.brand.images || [];
+  const sounds = S.state.sounds || [];
+  const assetRow = (ref, label, thumb) => `<label class="asset-row"><input type="checkbox" name="asset" value="${esc(ref)}">
+    ${thumb ? `<img class="asset-thumb" src="${thumb}" alt="">` : `<span class="asset-thumb ph">${I.music}</span>`}
+    <span class="asset-name">${esc(label)}</span>
+    <input type="text" class="asset-note" placeholder="What's it for? (optional)" maxlength="200" autocomplete="off"></label>`;
   const { people, contact } = S.state.brand;
   let last = 'all';
   try { last = localStorage.getItem('f247.contact') || 'all'; } catch {}
   if (!people.some((p) => p.id === last)) last = 'all';
   const shown = (o) => esc(o.folder ? `${o.folder} / ${o.name}` : o.name);
+  const styles = S.state.styles.filter((x) => x.ready);
+  let lastStyle = '';
+  try { lastStyle = localStorage.getItem('f247.style') || ''; } catch {}
+  if (!styles.some((x) => x.id === lastStyle)) lastStyle = '';
+  const pack = S.state.brand.pack;
   const m = $('#modal');
   m.innerHTML = `<form class="inner" method="dialog" data-form="edit">
     <div class="top"><div><h2 id="modal-title">${n > 1 ? `One video from ${n} clips` : 'Edit this clip'}</h2>
@@ -1035,15 +1300,38 @@ function openEditDialog(files) {
     <fieldset class="q contact-pick"><legend><h3>Who is this video for?</h3></legend><p>This decides the contact part at the end.</p>
       <div class="opts">
         <label class="opt"><input type="radio" name="contact" value="all" ${last === 'all' ? 'checked' : ''}><span><b>All sales</b><small>${contact ? `Ends with ${esc(contact.name || 'the brand contact')}` : 'No brand contact yet, so it ends with the logo'}</small></span></label>
-        ${people.map((p) => `<label class="opt"><input type="radio" name="contact" value="${esc(p.id)}" ${last === p.id ? 'checked' : ''}><span><b>${esc(p.onScreen)}</b><small>${p.lines.length ? esc(p.lines.map((l) => l.label).join(' · ')) : 'No numbers yet'}</small></span></label>`).join('')}
+        ${people.map((p) => `<label class="opt"><input type="radio" name="contact" value="${esc(p.id)}" ${last === p.id ? 'checked' : ''}><span><b>${esc(p.onScreen)}</b><small>${p.lines.length ? esc(p.lines.map((l) => l.label).join(' · ')) : 'No numbers yet'}${p.fb ? ' · Facebook' : ''}</small></span></label>`).join('')}
       </div>
       <a class="small" href="#/brand" data-jump="brand-details">${people.length ? 'Add or change sales people' : 'Add a sales person'} in My brand</a>
+    </fieldset>
+    ${styles.length ? `<fieldset class="q style-pick"><legend><h3>Which style?</h3></legend><p>How this video should look.</p>
+      <div class="opts">
+        <label class="opt"><input type="radio" name="style" value="" ${lastStyle ? '' : 'checked'}><span><b>${esc(mainStyleName())}</b><small>${S.state.setup.style ? 'Your main style' : 'Not set yet, so the editor uses its own'}</small></span></label>
+        ${styles.map((x) => `<label class="opt"><input type="radio" name="style" value="${esc(x.id)}" ${lastStyle === x.id ? 'checked' : ''}><span>${x.frames[0] ? `<img class="opt-frame" src="${frameSrc(x, x.frames[0])}" alt="">` : ''}<b>${esc(x.name)}</b><small>Learned from a video</small></span></label>`).join('')}
+      </div>
+      <a class="small" href="#/style">See my styles</a>
+    </fieldset>` : ''}
+    <fieldset class="q"><legend><h3>Preview first</h3></legend><p>Check the look before the full edit is made.</p>
+      <label class="tick"><input type="checkbox" name="preview">Show me a preview first<small>A storyboard and a 5-second sample. Worth it for a new style; skip it for a style you trust.</small></label>
+    </fieldset>
+    <fieldset class="q"><legend><h3>Sound effects</h3></legend><p>Makes the video feel lively.</p>
+      <label class="tick"><input type="checkbox" name="sfx" checked>Add sound effects<small>Whooshes, pops and dings on cuts and graphics</small></label>
+    </fieldset>
+    <fieldset class="q music-pick"><legend><h3>Background music</h3></legend><p>A quiet music bed under your voice.</p>
+      <div class="opts">
+        <label class="opt"><input type="radio" name="music" value="none" checked><span><b>No music</b><small>Voice (and effects) only</small></span></label>
+        <label class="opt"><input type="radio" name="music" value=""><span><b>Let the editor choose</b><small>${sounds.length ? 'Uses your My brand music when the style wants music' : 'Makes or skips music to fit the style'}</small></span></label>
+        ${sounds.map((f) => `<label class="opt"><input type="radio" name="music" value="track:${esc(f.folder ? `${f.folder}/${f.name}` : f.name)}"><span><b>${esc(f.name)}</b><small>From My brand</small></span></label>`).join('')}
+      </div>
+      ${sounds.length ? '' : '<a class="small" href="#/brand" data-jump="brand-music">Add music in My brand</a>'}
     </fieldset>
     <label class="field"><span>Name this video <span class="hint">(optional, so you can find it later)</span></span><input type="text" name="name" maxlength="80" placeholder="e.g. Why buy your car with us" autocomplete="off"></label>
     <label class="field"><span>Anything special for this video? <span class="hint">(optional)</span></span>
       <textarea name="instructions" placeholder="e.g. This is a promo for our new branch."></textarea></label>
-    <details class="more"><summary>${I.right}B-roll and extras</summary><div style="display:grid;gap:16px">
+    <details class="more"><summary>${I.right}B-roll, pictures and sounds</summary><div style="display:grid;gap:16px">
       <p class="small ${lib ? '' : 'muted'}">${lib ? `${I.check} Your brand's B-roll library (${plural(lib, 'clip')}) is used automatically.` : 'Tip: add B-roll in <a href="#/brand">My brand</a> so every video can use it.'}</p>
+      ${brandImgs.length ? `<div><p class="small muted" style="margin-bottom:8px">Pictures from My brand — tick the ones to use and say what each is for:</p><div class="asset-list">${brandImgs.map((x) => assetRow(`image:${x.name}`, x.name, `/media/brand/images/${enc(x.name)}?t=${Math.round(x.mtime)}`)).join('')}</div></div>` : ''}
+      ${sounds.length ? `<div><p class="small muted" style="margin-bottom:8px">Sounds from My brand — tick one and say what it's for (e.g. a voiceover line):</p><div class="asset-list">${sounds.map((f) => assetRow(`sound:${f.folder ? `${f.folder}/${f.name}` : f.name}`, f.folder ? `${f.folder} / ${f.name}` : f.name, null)).join('')}</div></div>` : ''}
       ${others.length ? `<div><p class="small muted" style="margin-bottom:8px">Extra B-roll just for this video:</p><div class="ticks">${others.map((o) => `<label class="tick"><input type="checkbox" name="broll" value="${esc(o.path)}">${shown(o)}<small>${fmtDur(o.duration)}</small></label>`).join('')}</div></div>` : ''}
       ${extras.length ? `<div><p class="small muted" style="margin-bottom:8px">Pictures or text from your inbox to use:</p><div class="ticks">${extras.map((o) => `<label class="tick"><input type="checkbox" name="extra" value="${esc(o.path)}">${shown(o)}</label>`).join('')}</div></div>` : ''}
     </div></details>
@@ -1111,7 +1399,7 @@ async function askImport() {
   const hasStyle = S.state.setup.style;
   return ask({
     title: 'Import a brand pack?',
-    body: hasStyle ? 'It replaces your style, logo, screenshot, brand contact and (if included) B-roll. A backup of your style is kept. Your own rules and sales people stay.' : 'It sets your style, logo, screenshot, brand contact and B-roll from your team.',
+    body: hasStyle ? 'It replaces your style, logo, screenshot, brand contact and (if included) B-roll, and adds the team’s pictures and learned styles. A backup of your style is kept. Your own rules and sales people stay.' : 'It sets your style, logo, screenshot, brand contact, B-roll, pictures and learned styles from your team.',
     ok: 'Choose the file',
   });
 }
@@ -1224,6 +1512,27 @@ addEventListener('drop', async (e) => {
 $('#picker').addEventListener('change', (e) => { uploadClips(e.target.files); e.target.value = ''; });
 $('#sound-picker').addEventListener('change', (e) => { upload(e.target.files, 'sounds'); e.target.value = ''; });
 $('#pack-picker').addEventListener('change', (e) => { importPack(e.target.files[0]); e.target.value = ''; });
+$('#style-picker').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file || !S.learnName) return;
+  const r = await sendFile(`/api/styles/learn?name=${enc(S.learnName)}&file=${enc(file.name)}`, file, 'Uploading');
+  if (r.error) return toast(r.error, { bad: true, ms: 9000 });
+  S.learnName = null;
+  askNotify();
+  toast(r.queued ? 'Saved. The editor studies it when it is free.' : 'The editor is studying your video…');
+  location.hash = `#/style/${enc(r.id)}`;
+});
+$('#clip-picker').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  const c = S.clipAt;
+  e.target.value = '';
+  if (!file || !c) return;
+  S.clipAt = null;
+  const r = await sendFile(`/api/projects/${c.slug}/insert?from=${enc(c.file)}&at=${c.at}&name=${enc(file.name)}`, file, `Putting in at ${fmtClock(c.at)}:`);
+  if (r.error) return toast(r.error, { bad: true, ms: 9000 });
+  S.sel[c.slug] = r.file; refresh(); toast('Done. This is the new version.');
+});
 $('#brand-picker').addEventListener('change', (e) => {
   const p = S.brandPick;
   if (p && e.target.files.length) upload(e.target.files, 'brand', `&slot=${p.slot}${p.category ? `&category=${enc(p.category)}` : ''}`);
@@ -1300,6 +1609,7 @@ const ACTIONS = {
       const r = route();
       if (r.name === 'folder' && gone.has(r.arg)) location.hash = '#/';
       if (r.name === 'project' && items.some((x) => x.area === 'project' && x.path === r.arg)) location.hash = '#/videos';
+      if (r.name === 'style' && items.some((x) => x.area === 'style' && x.path === r.arg)) location.hash = '#/style';
     } catch (e) { fail(e); }
   },
   'delete-picked': () => ACTIONS.delete({ items: JSON.stringify(S.pick.map((p) => ({ area: 'inbox', path: p }))), what: plural(S.pick.length, 'picked clip') }),
@@ -1328,6 +1638,43 @@ const ACTIONS = {
     t.value = `${t.value.trim() ? `${t.value.trimEnd()}\n` : ''}At ${fmtDur(v.currentTime) || '0:00'}: `;
     t.focus(); t.setSelectionRange(t.value.length, t.value.length);
   },
+  'cut-start': (d) => {
+    const v = $('.monitor video');
+    if (!v) return;
+    if (!v.duration) return toast('The video is still loading. Try again in a moment.');
+    v.pause();
+    const from = Math.min(v.currentTime, Math.max(0, v.duration - 1));
+    S.cut[d.slug] = { file: selected(proj(d.slug)).file, from, to: Math.min(v.duration, from + 1), dur: v.duration };
+    refresh();
+    $('[data-cut-handle="to"]')?.focus();
+  },
+  'cut-cancel': (d) => { delete S.cut[d.slug]; refresh(); },
+  'cut-preview': (d) => {
+    const v = $('.monitor video');
+    const c = S.cut[d.slug];
+    if (!v || !c) return;
+    c.preview = false;
+    v.currentTime = Math.max(0, c.from - 2);
+    v.play().then(() => { c.preview = true; }).catch(() => {});
+  },
+  'cut-end': async (d) => {
+    const c = S.cut[d.slug];
+    if (!c || c.busy) return;
+    $('.monitor video')?.pause();
+    if (selected(proj(d.slug))?.file !== c.file) { delete S.cut[d.slug]; refresh(); return toast('You switched versions. Start the cut again.'); }
+    c.busy = true; c.preview = false; refresh();
+    try {
+      const r = await api(`/api/projects/${d.slug}/cut`, { body: { from: c.file, start: c.from, end: c.to } });
+      delete S.cut[d.slug]; S.sel[d.slug] = r.file; refresh(); toast('Done. This is the new version.');
+    } catch (e) { c.busy = false; refresh(); fail(e); }
+  },
+  'add-clip': (d) => {
+    const v = $('.monitor video');
+    if (!v) return;
+    v.pause();
+    S.clipAt = { slug: d.slug, at: v.currentTime, file: selected(proj(d.slug)).file };
+    $('#clip-picker').click();
+  },
   target: (d) => { S.noteTarget[d.slug] = d.t; refresh(); },
   'send-note': async (d, el) => {
     const t = $('#note');
@@ -1345,6 +1692,10 @@ const ACTIONS = {
   final: async (d) => {
     if (!await ask({ title: 'Make the final version?', body: 'The editor renders this video at full quality. It takes a little longer than a draft.', ok: 'Make final' })) return;
     try { queuedToast(await api(`/api/projects/${d.slug}/final`, { body: {} })); askNotify(); } catch (e) { fail(e); }
+  },
+  go: async (d, el) => {
+    el.disabled = true;
+    try { const r = await api(`/api/projects/${d.slug}/go`, { body: {} }); askNotify(); r.queued ? queuedToast(r) : toast('Making the full edit…'); } catch (e) { fail(e); el.disabled = false; }
   },
   horizontal: async (d) => { try { queuedToast(await api(`/api/projects/${d.slug}/horizontal`, { body: {} })); askNotify(); } catch (e) { fail(e); } },
   retry: async (d) => { try { queuedToast(await api(`/api/projects/${d.slug}/retry`, { body: {} })); askNotify(); } catch (e) { fail(e); } },
@@ -1368,11 +1719,24 @@ const ACTIONS = {
       S[`${d.doc}Mode`] = 'read'; toast('Saved.'); loadDoc(d.doc);
     } catch (e) { fail(e); }
   },
-  'style-ask': async () => {
+  'style-ask': async (d) => {
     const t = $('#style-ask');
     if (!t.value.trim()) return t.focus();
-    try { const r = await api('/api/style/ask', { body: { text: t.value } }); S.docs.styleReply = null; t.value = ''; r.queued ? queuedToast(r) : toast('Updating your style…'); } catch (e) { fail(e); }
+    try {
+      const r = await api('/api/style/ask', { body: { text: t.value, styleId: d.style || null } });
+      if (d.style && S.docs.learned) S.docs.learned.reply = null; else S.docs.styleReply = null;
+      t.value = ''; r.queued ? queuedToast(r) : toast(d.style ? 'Updating this style…' : 'Updating your style…');
+    } catch (e) { fail(e); }
   },
+  'rename-style': () => { S.renamingStyle = true; S.focusRenameStyle = true; refresh(); },
+  'rename-style-cancel': () => { S.renamingStyle = false; refresh(); },
+  'rename-style-go': (d) => { S.renameOnEnter = d.id; location.hash = `#/style/${enc(d.id)}`; },
+  'style-duplicate': (d) => api(`/api/styles/${enc(d.id)}/duplicate`, { body: { branded: Boolean(d.branded) } }).then((r) => {
+    if (!d.branded) return toast(`Made a copy: “${r.name}”. It is in My styles.`);
+    location.hash = `#/style/${enc(r.id)}`;
+    r.queued ? queuedToast(r) : toast(`Putting your brand on “${r.name}”…`);
+  }).catch((e) => (/My brand first/.test(e.message) ? toast(e.message, { bad: true, link: { href: '#/brand', label: 'Open My brand' } }) : fail(e))),
+  'style-retry': (d) => api(`/api/styles/${enc(d.id)}/retry`, { body: {} }).then((r) => { askNotify(); r.queued ? queuedToast(r) : toast('Learning the style again…'); }).catch(fail),
   'wiz-back': () => { collectWizard(); S.wizard.step--; regionCache.clear(); refresh(); window.scrollTo(0, 0); },
   'wiz-next': async () => {
     collectWizard();
@@ -1396,12 +1760,13 @@ const ACTIONS = {
   'brand-pick': (d) => {
     S.brandPick = { slot: d.slot, category: d.category || null };
     const p = $('#brand-picker');
-    p.accept = d.slot === 'broll' ? 'video/*,.mov,.mp4,.m4v' : 'image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp';
-    p.multiple = d.slot === 'broll';
+    p.accept = d.slot === 'broll' ? 'video/*,.mov,.mp4,.m4v' : d.slot === 'font' ? '.ttf,.otf,.woff,.woff2' : 'image/png,image/jpeg,image/webp,.png,.jpg,.jpeg,.webp';
+    p.multiple = ['broll', 'image', 'font'].includes(d.slot);
     p.click();
   },
   'use-inbox': (d) => api('/api/brand/use-inbox', { body: { slot: d.slot, name: d.name } }).then(() => toast(d.slot === 'person' ? 'Sales person added. Check their title and numbers.' : 'Added to My brand.')).catch(fail),
   'add-line': (d, el) => { const box = $('[data-lines]', el.closest('form')); box.insertAdjacentHTML('beforeend', lineRow()); $$('input[name="label"]', box).at(-1).focus(); },
+  'add-row': (d, el) => { const box = $(`[data-lines="${d.kind}"]`, el.closest('form')); box.insertAdjacentHTML('beforeend', d.kind === 'color' ? colorRow() : gradientRow()); $$('input[type="text"]', box).at(-1).focus(); },
   'remove-line': (d, el) => { const row = el.closest('.line'); const next = row.nextElementSibling || row.previousElementSibling; row.remove(); next?.querySelector('input')?.focus(); },
   'import-pack': async () => { if (await askImport()) $('#pack-picker').click(); },
   unlock: async () => {
@@ -1413,6 +1778,7 @@ const ACTIONS = {
   'fix-setup': () => api('/api/setup/fix', { body: {} }).catch(fail),
   recheck: () => api('/api/setup/recheck', { body: {} }).then(() => toast('Checked.')).catch(fail),
   'set-perm': (d, el) => api('/api/settings', { body: { permissionMode: el.value } }).then(() => toast('Saved.')).catch(fail),
+  'set-brand-check': (d, el) => api('/api/settings', { body: { brandCheck: el.checked } }).then(() => toast(el.checked ? 'Brand check is on.' : 'Brand check is off.')).catch(fail),
   'set-model': (d, el) => api('/api/settings', { body: { model: el.value } }).then(() => toast('Saved.')).catch(fail),
 };
 
@@ -1452,13 +1818,26 @@ document.addEventListener('submit', async (e) => {
     try { await api('/api/settings/groq', { body: { key: k.value } }); k.value = ''; toast('Key saved.'); } catch (err) { fail(err); }
   }
   const formLines = () => $$('.line', form).map((row) => ({ label: $('input[name="label"]', row).value, value: $('input[name="value"]', row).value }));
+  if (kind === 'look') {
+    const rows = (k) => $$(`[data-lines="${k}"] .line`, form);
+    const colors = rows('color').map((r) => ({ hex: $('[name="hex"]', r).value, label: $('[name="label"]', r).value }));
+    const gradients = rows('gradient').map((r) => ({ from: $('[name="from"]', r).value, to: $('[name="to"]', r).value, angle: Number($('[name="angle"]', r).value), label: $('[name="label"]', r).value }));
+    try { await api('/api/brand/look', { body: { colors, gradients, feel: form.elements.feel.value } }); toast('Colors and feel saved.'); } catch (err) { fail(err); }
+  }
+  if (kind === 'fonts') {
+    const fonts = Object.fromEntries($$('input[name="mood"]', form).map((i) => [i.dataset.file, i.value]));
+    try { await api('/api/brand/look', { body: { fonts } }); toast('Font moods saved.'); } catch (err) { fail(err); }
+  }
+  if (kind === 'about') {
+    try { await api('/api/brand/look', { body: { about: form.elements.about.value } }); toast('Saved. The editor uses it on every video.'); } catch (err) { fail(err); }
+  }
   if (kind === 'bcontact') {
     try { await api('/api/brand/contact', { body: { name: form.elements.name.value, lines: formLines() } }); toast('Brand contact saved.'); } catch (err) { fail(err); }
   }
   if (kind === 'person') {
     const el = form.elements;
     try {
-      await api('/api/people', { body: { id: form.dataset.id || null, title: el.title.value, name: el.name.value, pronoun: el.pronoun.value, lines: formLines() } });
+      await api('/api/people', { body: { id: form.dataset.id || null, title: el.title.value, name: el.name.value, pronoun: el.pronoun.value, lines: formLines(), fb: el.fb.value } });
       S.personEdit = null; toast('Sales person saved.'); refresh();
     } catch (err) { fail(err); }
   }
@@ -1477,6 +1856,22 @@ document.addEventListener('submit', async (e) => {
     if (!paths.length) return toast('Pick at least one clip.');
     try { const r = await api('/api/move', { body: { paths, folder: form.dataset.folder } }); $('#modal').close(); toast(`${plural(r.count, 'clip')} moved here.`); } catch (err) { fail(err); }
   }
+  if (kind === 'learn') {
+    const input = $('#learn-name');
+    if (!input.value.trim()) return input.focus();
+    S.learnName = input.value.trim();
+    $('#style-picker').click();
+  }
+  if (kind === 'rename-style') {
+    const input = $('#rename-style');
+    if (!input.value.trim()) return input.focus();
+    const id = form.dataset.id;
+    try {
+      await api(id === 'main' ? '/api/style/rename' : `/api/styles/${enc(id)}/rename`, { body: { name: input.value } });
+      S.renamingStyle = false; toast('Renamed.');
+      if (id === 'main') refresh(); else loadLearned(id);
+    } catch (err) { fail(err); }
+  }
   if (kind === 'newcat') {
     const input = $('#newcat');
     const c = input.value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
@@ -1491,7 +1886,7 @@ document.addEventListener('submit', async (e) => {
     if (!name) return form.elements.name.focus();
     const a = document.createElement('a');
     const on = (k) => (form.elements[k].checked ? 1 : 0);
-    a.href = `/api/brand/export?name=${enc(name)}&broll=${on('broll')}&music=${on('music')}&people=${on('people')}`;
+    a.href = `/api/brand/export?name=${enc(name)}&broll=${on('broll')}&music=${on('music')}&images=${on('images')}&styles=${on('styles')}&people=${on('people')}`;
     a.download = '';
     document.body.append(a); a.click(); a.remove();
     toast('Making your brand pack. Send the file to your teammates any way you like.', { ms: 8000 });
@@ -1501,12 +1896,16 @@ document.addEventListener('submit', async (e) => {
     const btn = $('button[type="submit"]', form);
     btn.disabled = true;
     try {
+      // A row counts as picked when ticked or when its "what's it for" note is filled in.
+      const assets = $$('.asset-row', form).map((row) => ({ ref: $('input[name="asset"]', row).value, on: $('input[name="asset"]', row).checked, note: $('.asset-note', row).value.trim() }))
+        .filter((a) => a.on || a.note).map(({ ref, note }) => ({ ref, note }));
       const r = await api('/api/edit', { body: {
         files: S.dialog.files, keepOrder: S.dialog.keep, name: fd.get('name') || '',
         instructions: fd.get('instructions') || '', broll: fd.getAll('broll'), extra: fd.getAll('extra'),
         contact: fd.get('contact') && fd.get('contact') !== 'all' ? { type: 'person', id: fd.get('contact') } : { type: 'all' },
+        style: fd.get('style') || '', music: fd.get('music') || '', sfx: fd.get('sfx') === 'on', assets, preview: fd.get('preview') === 'on',
       } });
-      try { localStorage.setItem('f247.contact', fd.get('contact') || 'all'); } catch {}
+      try { localStorage.setItem('f247.contact', fd.get('contact') || 'all'); localStorage.setItem('f247.style', fd.get('style') || ''); } catch {}
       $('#modal').close();
       S.pick = [];
       askNotify(); queuedToast(r);
