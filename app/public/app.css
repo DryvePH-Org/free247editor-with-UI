@@ -439,6 +439,23 @@ details.more[open] summary { margin-bottom: 12px; }
 .card-del:hover, .card-del:focus-visible { background: color-mix(in srgb, var(--rec) 10%, var(--surface)); color: var(--rec); }
 .pickable .body, .card:has(.card-del) .body { padding-right: 48px; }
 .chip-del { display: inline-flex; align-items: center; gap: 2px; }
+/* Replace background (clean raw videos) */
+.bg-step { display: grid; gap: 10px; padding-top: 14px; margin-top: 14px; border-top: 1px solid var(--line); }
+.bg-step:first-of-type { border-top: 0; margin-top: 4px; padding-top: 0; }
+.bg-pics { display: flex; gap: 10px; flex-wrap: wrap; }
+.bg-pics figure { margin: 0; display: grid; gap: 4px; font-size: .8125rem; color: var(--muted); }
+.bg-pics img { width: 108px; aspect-ratio: 9 / 16; object-fit: cover; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--sunk); }
+.bg-pics.wide img { width: 216px; }
+.verdict { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 600; font-size: .875rem; border: 1px solid currentColor; }
+.verdict.good { color: var(--ok); }
+.verdict.fixable { color: var(--tape-ink); background: var(--tape-pale); border-color: var(--tape); }
+.verdict.bad { color: var(--rec); }
+.bg-price { width: 100%; border-collapse: collapse; font-size: .9375rem; }
+.bg-price td { padding: 8px 6px; border-top: 1px solid var(--line); }
+.bg-price td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.bg-step textarea { min-height: 120px; font-size: .875rem; }
+.bg-run { display: grid; gap: 8px; padding: 12px; border: 1px solid var(--line); border-radius: var(--r); }
+.bg-flag { color: var(--rec); }
 .chip-del .btn.icon { color: var(--muted); }
 .chip-del .btn.icon:hover { color: var(--rec); }
 .btn.quiet.danger:hover { background: color-mix(in srgb, var(--rec) 10%, var(--surface)); color: var(--rec); }

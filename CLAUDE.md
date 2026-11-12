@@ -11,6 +11,7 @@ editing or coding terms.
 | `setup.mjs` | One-time setup. Safe to re-run. |
 | `app/` | Local web app (`node app/server.mjs`, or double-click `Open Editor`). It runs `claude -p` here, so this file still drives every edit. |
 | `tools/transcribe.mjs` | Free word-level transcription (Groq, or `--local` faster-whisper). |
+| `tools/bgswap/` | Clean raw edits and background replacement: `prep.sh` (iPhone HDR to normal colors, 1080x1920 30fps), `render_cuts.py` (hard cuts plus voice cleanup), and the app's Higgsfield helpers (`chunks.py`, `hf_run.sh`, `sync.py`, `assemble.py`). Mac only for now. |
 | `tools/voiceover.mjs` | Free local text to speech (Kokoro, no Python) for voice lines when there is no recording. |
 | `inbox/` | Raw videos the user wants edited. May have one level of folders, usually one folder per video. |
 | `outbox/` | Every draft and final you render, named `<slug>-v1.mp4`, `<slug>-final.mp4`. |
@@ -170,6 +171,73 @@ any other paid API). The default is to use none of them.
    a heading named exactly `## Not done`: one plain-words bullet each, saying what the user could
    add (for example "No B-roll of the showroom yet. Add some in My brand."). The app shows it.
 
+## Clean raw edit
+
+When the request says clean raw: the user wants only the cuts, for example before replacing the background.
+Remove silences and mistakes and clean up the voice. Add nothing: no captions, graphics, zooms, transitions,
+sound effects, music, color grading, hook text or contact part. The style, brand look and rules about looks do
+not apply. It is all local and free, so do not stop for approval. Work in `kit/video-projects/<slug>/` but do not
+run `new-video` (no HyperFrames project is needed).
+
+1. Prep each clip (never touch the original):
+   `tools/bgswap/prep.sh <clip> kit/video-projects/<slug>/assets/raw/<name>.mp4`. It turns iPhone HDR into normal
+   colors (a plain convert looks grey) and makes H.264 1080x1920 30fps with the original audio.
+2. Transcribe each prepped clip with `node tools/transcribe.mjs <file>` (add `--local` when `.env` has no Groq key).
+   Several clips: put them in story order as "Editing" step 1 says, join them in that order into
+   `kit/video-projects/<slug>/assets/joined.mp4` (ffmpeg concat demuxer, `-c copy`), and transcribe the joined file.
+3. Write `kit/video-projects/<slug>/keep.json`: `[[start, end], ...]` in seconds of the prepped (or joined) file, from
+   the word timestamps. Cut pauses longer than about 0.35 s but keep 0.15 to 0.2 s of breath around speech, so it
+   does not sound chopped. Cut mistakes, false starts, restarted sentences and repeated takes; when a line is said
+   more than once, keep the last clean take. Never cut inside a word.
+4. `python3 -I tools/bgswap/render_cuts.py <prepped or joined> kit/video-projects/<slug>/keep.json kit/video-projects/<slug>/edited-v1.mp4`
+   (hard cuts, voice denoised; it also writes the cut points beside the output, which the background replacement
+   uses to split at pauses). Copy it to `outbox/<slug>-v1.mp4`.
+5. Final message: 3 to 5 short bullets saying what was cut, listing each retake removed with its time in the new video.
+
+Notes on a clean raw video: change `keep.json` (times in notes are from the version the user watched, so map them
+back through the kept parts), render `edited-v<n>.mp4` and copy it to `outbox/<slug>-v<n>.mp4`. Still add nothing.
+Approved: copy the newest version to `outbox/<slug>-final.mp4` and `edited-final.mp4` (with its `.cuts.json`).
+
+## Background check
+
+Background replacement is optional and needs Higgsfield, which some teammates do not have. A clean raw video is
+finished without it, so never tell the user they must replace the background.
+
+When the app asks for a background check: decide whether the user's photo can believably replace the room behind
+them in their clean video. It is free: do not run `higgsfield` or anything that costs money.
+
+1. Pull 2 frames of the clean video (about 2 s in, and the middle), 540 px wide, into the `bgswap/` folder named in
+   the request. Look at them and at the photo.
+2. Compare, and note each problem in plain words:
+   - Camera height and angle. This matters most: Kling copies the photo's angle as it is, so the room and the person
+     end up seen from two angles. Judge it from things you can measure, not the overall feel:
+     - Where the top of the seat back sits, as a share of the frame height, in the video frame and in the 9:16 crop.
+       More than about 8% apart means a different camera height or distance.
+     - How much of the seat's top surface shows. A thin strip means the camera is near seat height; a deep cushion
+       top (or floor, rug or table in front) means it looked down from standing height.
+     - Whether you see the tops of things behind (a car roof, a table top) that the video's camera would see edge-on.
+     If any of these differ, or you are unsure, the verdict is "fixable", not "good": the angle-matched background
+     costs about 2 credits, a wasted video run costs far more. Real case: a photo taken standing, looking down at
+     a sofa (deep cushion tops, car roof visible), behind a seated straight-on video, gave a Kling result with the
+     two angles mixed.
+   - Lens and distance: wide or tight; will the furniture look the right size next to the person?
+   - Light: direction, warmth and brightness compared with how the person is lit.
+   - A believable spot for the person (a seat or floor) in the same place in the frame as now.
+   - People, tables, cups or other things in front that the model would copy in or put over the person.
+   - Resolution, and whether it crops well to a vertical 9:16 frame.
+3. Write `check.json`: `{ "verdict": "good" | "fixable" | "bad", "points": ["…"], "fix": "…" }`, short plain-words
+   points (what fits and what does not), and `fix` only when it is not good. When the angle is wrong, the fix is the
+   app's "Make an angle-matched background" button, which makes an empty room from the video's camera angle.
+4. Make `background_9x16.png`: crop the photo to 9:16, keeping the seat where the person will sit centered, and
+   scale it to 1080x1920 (`crop=trunc(ih*9/16/2)*2:ih:<x>:0,scale=1080:1920:flags=lanczos`). Skip this when
+   `plate.png` exists; the app uses that instead.
+5. Write `prompt.txt` from this template, filling in the brackets from what you saw (same prompt for every part):
+   "Edit the video. Keep the [woman/man] exactly the same: [her/his] face, expressions, lip movements, hair, clothing,
+   hand gestures, and [pose]. Replace the entire environment, including [what they sit or stand on], with the scene in
+   the reference image. [Where and how they sit or stand in the new room, with natural contact shadows.] [Light that
+   matches the reference.] Static camera, same framing. Photorealistic, natural phone-camera look."
+6. Final message: the verdict and 2 to 4 short bullets.
+
 ## Preview first
 
 When the request says preview first, do steps 1 to 5 of "Editing", but before building the whole edit:
@@ -212,7 +280,8 @@ that is not branded keeps its own colors and fonts, so check only the logo and c
 
 ## Never
 
-- Post, upload, or send a video anywhere.
+- Post, upload, or send a video anywhere. (Background replacement uploads to Higgsfield only from the app's
+  buttons, after the user confirmed the price. Never run `higgsfield generate create` yourself.)
 - Print or log the Groq key.
 - Commit or publish anything in `inbox/`, `outbox/`, `my-style.md`, `my-rules.md`, `my-sounds/`,
   `my-brand/`, `my-styles/`, `my-people.json`, or `.webapp/`.

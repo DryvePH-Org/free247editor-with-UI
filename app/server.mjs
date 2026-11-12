@@ -19,6 +19,7 @@ import { homedir } from 'node:os';
 import { basename, delimiter, dirname, extname, join, relative, resolve } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
+import { createBgSwap } from './bgswap.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pub = join(root, 'app', 'public');
@@ -42,7 +43,7 @@ for (const d of [...Object.values(dirs), brollDir, imagesDir, fontsDir, projects
 
 const win = process.platform === 'win32';
 // Double-click launchers start without the user's shell profile, so add the usual install places.
-const extraPath = win ? [] : [join(homedir(), '.local', 'bin'), join(homedir(), '.claude', 'local'),
+const extraPath = win ? [] : [join(homedir(), '.local', 'bin'), join(homedir(), '.claude', 'local'), join(homedir(), '.npm-global', 'bin'),
   '/opt/homebrew/bin', '/usr/local/bin'];
 process.env.PATH = [...new Set([...process.env.PATH.split(delimiter), ...extraPath])].join(delimiter);
 
@@ -56,6 +57,7 @@ const MIME = {
   '.ttf': 'font/ttf', '.otf': 'font/otf', '.woff': 'font/woff', '.woff2': 'font/woff2',
 };
 const PERMISSION_MODES = ['auto', 'bypassPermissions'];
+const bg = createBgSwap({ root, onChange: () => pushState() });
 const MODELS = ['', 'opus', 'sonnet', 'fable'];
 
 // ---------- small helpers ----------
@@ -696,7 +698,7 @@ function pumpPreviews() {
 // conversation so notes continue where the edit left off. Projects edited from the terminal
 // (outbox files with no record) show up too.
 
-const VERSION_RE = /^(.+?)-((?:horizontal-)?(?:v\d+|final))\.mp4$/i;
+const VERSION_RE = /^(.+?)-((?:horizontal-|bg-[a-z0-9]+-)?(?:v\d+|final))\.mp4$/i;
 const projectFile = (slug) => join(projectsDir, `${slug}.json`);
 const loadProject = (slug) => readJson(projectFile(slug), null);
 const saveProject = (p) => writeJson(projectFile(p.slug), p);
@@ -710,7 +712,7 @@ function versionsBySlug() {
     if (!map.has(slug)) map.set(slug, []);
     map.get(slug).push({ file: f.name, label: label.toLowerCase(), mtime: f.mtime, size: f.size });
   }
-  const order = (l) => (l.startsWith('horizontal') ? 1000 : 0) + (l.endsWith('final') ? 500 : Number(l.match(/\d+/)?.[0] || 0));
+  const order = (l) => (l.startsWith('horizontal') ? 1000 : l.startsWith('bg-') ? 2000 : 0) + (l.endsWith('final') ? 500 : Number(l.match(/\d+/)?.[0] || 0));
   for (const list of map.values()) list.sort((a, b) => order(a.label) - order(b.label));
   return map;
 }
@@ -773,7 +775,7 @@ function listProjects() {
     return {
       ...pub, slug, versions: v, updatedAt: updated, title: rec.title || prettyTitle(slug),
       sources: rec.sources || (rec.source ? [rec.source] : terminalSources(slug)), notDone: v.length ? notDone(slug) : [], canRetry: Boolean(lastRequest),
-      preview: previews.get(slug) || null,
+      preview: previews.get(slug) || null, bg: rec.clean ? bg.view(slug) : null,
     };
   }).sort((a, b) => b.updatedAt - a.updatedAt);
 }
@@ -786,9 +788,24 @@ function terminalSources(slug) {
 }
 const prettyTitle = (slug) => slug.replace(/-\d{4}-\d{2}-\d{2}$/, '').replace(/-/g, ' ').replace(/^\w/, (c) => c.toUpperCase());
 
+function cleanSource(slug) {
+  const vs = (versionsBySlug().get(slug) || []).filter((v) => /^(v\d+|final)$/.test(v.label));
+  const v = vs.find((x) => x.label === 'final') || vs.at(-1);
+  if (!v) return null;
+  const kept = join(root, 'kit', 'video-projects', slug, `edited-${v.label}.mp4`);
+  return { name: v.file, path: existsSync(kept) ? kept : join(dirs.outbox, v.file) };
+}
+// A finished background run becomes the next <slug>-bg-<model>-vN.mp4 in the outbox.
+function saveBgVersion(slug, model, file) {
+  const nums = (versionsBySlug().get(slug) || []).map((v) => v.label.match(new RegExp(`^bg-${model}-v(\\d+)$`))?.[1]).filter(Boolean).map(Number);
+  const name = `${slug}-bg-${model}-v${Math.max(0, ...nums) + 1}.mp4`;
+  copyFileSync(file, join(dirs.outbox, name));
+  return name;
+}
+
 function nextVersion(slug, horizontal = false) {
   const nums = (versionsBySlug().get(slug) || [])
-    .filter((v) => v.label.startsWith('horizontal') === horizontal)
+    .filter((v) => !v.label.startsWith('bg-') && v.label.startsWith('horizontal') === horizontal)
     .map((v) => Number(v.label.match(/v(\d+)/)?.[1] || 0));
   return Math.max(0, ...nums) + 1;
 }
@@ -889,6 +906,7 @@ const APP_NOTE = [
   '(for example: "No B-roll of the showroom yet. Add some in My brand.").',
 ].join(' ');
 
+const CLEAN_NOTE = 'This is a clean raw edit: follow "Clean raw edit" in CLAUDE.md (cuts and voice cleanup only, nothing added). ';
 const noteFile = join(data, 'app-note.txt');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -991,7 +1009,7 @@ function startJob({ kind, slug = null, styleId = null, title, prompt, resume = n
     : spawn('claude', args, { cwd: root, detached: true });
   const versionsBefore = slug ? (versionsBySlug().get(slug) || []).map((v) => `${v.file}:${v.mtime}`).join() : '';
   job = { id: randomUUID(), kind, slug, styleId, title, steps: [], todos: [], startedAt: Date.now(), proc, sessionId: resume, rulesBefore, versionsBefore };
-  addStep({ go: 'Building the full edit', edit: 'Getting your clips ready', style: 'Updating your style', learn: 'Watching your sample video', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version' }[kind] || 'Reading your notes');
+  addStep({ go: 'Building the full edit', edit: 'Getting your clips ready', style: 'Updating your style', learn: 'Watching your sample video', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version', bgcheck: 'Looking at your background photo' }[kind] || 'Reading your notes');
   proc.stdin.end(prompt);
 
   let buf = '';
@@ -1061,7 +1079,7 @@ function buildJob(req) {
   if (req.slug && !p) return null;
   const quick = p?.quickEdits?.length ? `Since the last render the user made quick edits in the app with ffmpeg, which are not in the project files yet: ` +
     `${p.quickEdits.join('; ')}. Redo them in the project first so they carry into this render. ` : '';
-  const ctx = p ? `${contextFor(p)}${p.style && stylePrompt(p.style) ? `${stylePrompt(p.style)} ` : ''}${quick}` : '';
+  const ctx = p ? `${p.clean ? CLEAN_NOTE : ''}${contextFor(p)}${p.style && stylePrompt(p.style) ? `${stylePrompt(p.style)} ` : ''}${quick}` : '';
   const resume = p?.sessionId || null;
   const base = { kind: req.type, slug: req.slug || null, styleId: req.styleId || null, title: p?.title || req.title, resume };
   if (req.type === 'edit') return { ...base, prompt: req.prompt, resume: null };
@@ -1102,6 +1120,13 @@ function buildJob(req) {
     if (!st?.source) return null;
     return { ...base, title: `Learning “${st.name}”`, prompt: `Learn a new style called "${st.name}" from the sample video my-styles/${st.id}/${st.source}. ` +
       `Follow "Learning a style from a video" in CLAUDE.md, working in my-styles/${st.id}/.` };
+  }
+  if (req.type === 'bgcheck') {
+    const src = cleanSource(req.slug);
+    const photo = bg.view(req.slug)?.photo;
+    if (!src || !photo) return null;
+    return { ...base, resume: null, prompt: `Background check for ${req.slug}: follow "Background check" in CLAUDE.md. The clean video is ` +
+      `outbox/${src.name}. The photo is kit/video-projects/${req.slug}/bgswap/${photo}. Work in kit/video-projects/${req.slug}/bgswap/.` };
   }
   if (req.type === 'setup') {
     return { ...base, title: 'Setup', prompt: [
@@ -1217,6 +1242,8 @@ function checkTools(force = false) {
     claude: claudeOk,
     chrome: chromeFound(),
     localWhisper: ok('python3', ['-c', 'import faster_whisper']) || ok('python', ['-c', 'import faster_whisper']),
+    // Optional: background replacement only. Succeeds when installed, signed in and a workspace is picked.
+    higgsfield: ok('higgsfield', ['account', 'status']),
   };
   return toolCache;
 }
@@ -1381,7 +1408,8 @@ const server = createServer(async (req, res) => {
       res.write(`event: state\ndata: ${JSON.stringify(getState())}\n\n`);
       if (setupRun) res.write(`event: setup\ndata: ${JSON.stringify({ running: true, lines: setupRun.lines })}\n\n`);
       clients.add(res);
-      const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+      // A named event, not an SSE comment: the page can see it and reconnects when pings stop (e.g. after sleep).
+      const ping = setInterval(() => res.write('event: ping\ndata: 1\n\n'), 25000);
       req.on('close', () => { clients.delete(res); clearInterval(ping); });
       return;
     }
@@ -1630,7 +1658,7 @@ const server = createServer(async (req, res) => {
 
     // One video from one or more clips. Several clips are parts (and retakes) of the same talk.
     if (path === '/api/edit' && req.method === 'POST') {
-      const { files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null, style = '', music = '', sfx = true, assets = [], preview = false } = await body(req);
+      const { files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null, style = '', music = '', sfx = true, assets = [], preview = false, clean = false } = await body(req);
       const inInbox = (list) => [...new Set((Array.isArray(list) ? list : []).map(safePath))].filter((n) => n && existsSync(inboxFull(n)));
       const clips = inInbox(files).filter((n) => kindOf(n) === 'video');
       if (!clips.length) return send(res, 400, { error: 'Those clips are not in your inbox anymore.' });
@@ -1638,7 +1666,7 @@ const server = createServer(async (req, res) => {
       const slug = newSlug(String(videoName).trim() || basename(clips[0]));
       const choice = contact?.type === 'person' && readPeople().some((x) => x.id === contact.id) ? { type: 'person', id: contact.id } : { type: 'all' };
       const learned = findStyle(style);
-      const styleUse = learned?.ready ? learned : null;
+      const styleUse = learned?.ready && clean !== true ? learned : null;
       const brollNames = inInbox(broll).filter((n) => !clips.includes(n));
       const extraNames = inInbox(extra);
       const list = (ns) => ns.map((n) => `inbox/${n}`).join(', ');
@@ -1662,11 +1690,18 @@ const server = createServer(async (req, res) => {
         : 'Add sound effects so the video feels lively, even if the style says voice only: a whoosh, pop, ding or similar on cuts, ' +
           'transitions, text cards, stickers and graphics, always quieter than the voice. Use effects from my-sounds/sfx/ (named by kind, like whoosh-2.wav) and any other sound in my-sounds/ under 15 seconds, when there are any; ' +
           'otherwise make simple ones with FFmpeg.';
-      const prompt = [
-        `edit this: ${list(clips)}`,
-        clips.length > 1 && (keepOrder
+      const multi = clips.length > 1 && (keepOrder
           ? `These ${clips.length} clips are parts of one video. Keep them in exactly this order, and drop retakes and false starts inside them.`
-          : `These ${clips.length} clips are parts of one video, filmed as separate takes. Listen to all of them, put them in story order, and drop retakes and false starts. Copy each into assets/raw/ and keep the originals untouched.`),
+          : `These ${clips.length} clips are parts of one video, filmed as separate takes. Listen to all of them, put them in story order, and drop retakes and false starts. Copy each into assets/raw/ and keep the originals untouched.`);
+      const notes = String(instructions).trim() ? `Notes from me for this video: ${String(instructions).trim()}` : '';
+      // Clean raw: cuts and voice cleanup only, so none of the look, sound or contact choices apply.
+      const prompt = (clean === true ? [
+        `edit this: ${list(clips)}`, multi,
+        `Clean raw edit: follow "Clean raw edit" in CLAUDE.md. Use the slug "${slug}" exactly, and save the first draft as outbox/${slug}-v1.mp4.`,
+        notes,
+      ] : [
+        `edit this: ${list(clips)}`,
+        multi,
         preview === true
           ? `Use the slug "${slug}" exactly. Preview first: follow "Preview first" in CLAUDE.md. Save the 5-second sample as outbox/${slug}-preview.mp4 ` +
             `and the storyboard frames as outbox/${slug}-preview-01.jpg, -02.jpg, and so on. Do not render the full draft until I say it looks good.`
@@ -1678,13 +1713,13 @@ const server = createServer(async (req, res) => {
         sfxLine,
         contactPrompt(choice),
         styleUse ? stylePrompt(styleUse.id) : '',
-        String(instructions).trim() ? `Notes from me for this video: ${String(instructions).trim()}` : '',
-      ].filter(Boolean).join('\n');
+        notes,
+      ]).filter(Boolean).join('\n');
       const reqObj = { id: randomUUID(), type: 'edit', slug, title, prompt, styleId: styleUse?.id || null };
       saveProject({
-        slug, title, source: clips[0], sources: clips, broll: brollNames, contact: choice, contactLabel: contactLabel(choice),
+        slug, title, source: clips[0], sources: clips, broll: brollNames, contact: choice, contactLabel: clean === true ? null : contactLabel(choice), clean: clean === true,
         style: styleUse?.id || null, styleName: styleUse?.name || null, createdAt: Date.now(), updatedAt: Date.now(),
-        status: 'queued', sessionId: null, history: [], previewFirst: preview === true,
+        status: 'queued', sessionId: null, history: [], previewFirst: preview === true && clean !== true,
       });
       const r = request(reqObj);
       if (r.error) { rmSync(projectFile(slug), { force: true }); return send(res, 409, r); }
@@ -1751,6 +1786,48 @@ const server = createServer(async (req, res) => {
       const r = await quickEdit(m[1], safeName(url.searchParams.get('from') || ''), { at: url.searchParams.get('at'), clip });
       if (r.error) rmSync(clip, { force: true });
       return send(res, r.error ? 409 : 200, r);
+    }
+
+    // ---------- background replacement (clean raw videos) ----------
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/bg\/photo$/)) && req.method === 'PUT') {
+      const p = listProjects().find((x) => x.slug === m[1]);
+      if (!p?.clean) return send(res, 404, { error: 'Background replacement is for clean raw videos.' });
+      const ext = extname(String(url.searchParams.get('name') || '')).toLowerCase();
+      if (!['.jpg', '.jpeg', '.png', '.webp'].includes(ext)) return send(res, 400, { error: 'That needs to be a JPG, PNG or WebP photo.' });
+      const dir = bg.dirOf(m[1]);
+      mkdirSync(dir, { recursive: true });
+      const name = `photo${ext}`;
+      try { await pipeline(req, createWriteStream(join(dir, name))); } catch { return send(res, 500, { error: 'Could not save the photo. Is the disk full?' }); }
+      bg.photoSaved(m[1], name);
+      return send(res, 200, { ok: true });
+    }
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/bg\/(check|prices|plate-price|plate|generate|again)$/)) && req.method === 'POST') {
+      const [, slug, action] = m;
+      const p = listProjects().find((x) => x.slug === slug);
+      if (!p?.clean) return send(res, 404, { error: 'Background replacement is for clean raw videos.' });
+      const src = cleanSource(slug);
+      if (!src) return send(res, 400, { error: 'There is no clean version yet.' });
+      const b = await body(req);
+      try {
+        if (action === 'check') {
+          const reqObj = { type: 'bgcheck', slug };
+          const r = request(reqObj);
+          if (r.error) return send(res, 409, r);
+          noteAsked(slug, 'Check my background photo.', r, reqObj);
+          return send(res, 200, { ok: true, queued: Boolean(r.queued) });
+        }
+        if (action === 'prices') { bg.prices(slug, src); return send(res, 200, { ok: true }); }
+        if (action === 'plate-price') return send(res, 200, { credits: await bg.platePrice(slug, src) });
+        if (action === 'plate') { bg.makePlate(slug, src); return send(res, 200, { ok: true }); }
+        const opts = { onDone: (model, file) => saveBgVersion(slug, model, file) };
+        if (action === 'generate') bg.generate(slug, Array.isArray(b.picks) ? b.picks.slice(0, 4) : [], b.prompt, opts);
+        else bg.again(slug, String(b.key || ''), b.chunk ? String(b.chunk) : null, opts);
+        return send(res, 200, { ok: true });
+      } catch (e) { return send(res, 409, { error: e.message }); }
+    }
+    // Pictures from the background work folder: the photo, the reference, and the boundary stills.
+    if ((m = path.match(/^\/bgfile\/([a-z0-9-]+)\/((?:runs\/[a-z]+-\d+p\/boundaries\/)?[a-z0-9_.]+\.(?:jpe?g|png|webp))$/))) {
+      return serveFile(req, res, join(bg.dirOf(m[1]), ...m[2].split('/')));
     }
 
     if (path === '/api/stop' && req.method === 'POST') { stopJob(); return send(res, 200, { ok: true }); }
@@ -1967,3 +2044,6 @@ listen();
 const shutdown = () => { if (job) stopJob(); process.exit(0); };
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
+// Closing the Terminal window sends SIGHUP. The edit runs in its own process group, so without this it kept
+// running unseen after the app closed, and a restarted app could start a second edit on the same video.
+process.on('SIGHUP', shutdown);

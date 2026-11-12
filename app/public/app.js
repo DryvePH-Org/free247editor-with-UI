@@ -53,7 +53,7 @@ const ago = (t) => {
   return new Date(t).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
 };
 const elapsed = (since) => { const s = Math.max(0, Math.round((Date.now() - since) / 1000)); return s < 3600 ? `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`; };
-const tapeLabel = (l) => l === 'final' ? 'Final' : l === 'horizontal-final' ? 'YouTube final' : l.startsWith('horizontal-') ? `YouTube ${l.slice(11)}` : l;
+const tapeLabel = (l) => l.startsWith('bg-') ? l.replace(/^bg-(\w)(\w*)-/, (_, a, b) => `${a.toUpperCase()}${b} bg `) : l === 'final' ? 'Final' : l === 'horizontal-final' ? 'YouTube final' : l.startsWith('horizontal-') ? `YouTube ${l.slice(11)}` : l;
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const prettyCat = (c) => c.replace(/-/g, ' ').replace(/^\w/, (x) => x.toUpperCase());
 // Sound effects live in my-sounds/sfx as <kind>-<n>.*, kept apart from the music list.
@@ -64,7 +64,7 @@ function sfxSummary() {
   return `<p class="small muted" style="margin-top:12px">${plural(sfx.length, 'sound effect')} in ${plural(kinds.length, 'kind')}: ${esc(kinds.map((k) => k.replace(/-/g, ' ')).join(', '))}. The editor picks from them.
     <button class="btn quiet sm" data-action="reveal" data-area="sounds" data-folder="${esc(sfx[0].folder)}" data-name="${esc(sfx[0].name)}">Show in folder</button></p>`;
 }
-const JOB_LABEL = { edit: 'New video', go: 'Full edit', notes: 'Notes', final: 'Final version', horizontal: 'YouTube version', style: 'Style update', learn: 'Learning a style', setup: 'Setup' };
+const JOB_LABEL = { bgcheck: 'Background check', edit: 'New video', go: 'Full edit', notes: 'Notes', final: 'Final version', horizontal: 'YouTube version', style: 'Style update', learn: 'Learning a style', setup: 'Setup' };
 
 // Small markdown: headings, lists, tables, quotes, code, bold, italics, links.
 const inline = (t) => esc(t)
@@ -139,8 +139,15 @@ function toast(text, { bad = false, link = null, ms = 5000 } = {}) {
 const fail = (e) => toast(e.message || String(e), { bad: true, ms: 7000 });
 
 // ---------- live updates ----------
+let lastHeard = Date.now();
 function connect() {
   const es = new EventSource('/api/events');
+  // A connection can die silently (laptop sleep, network change) and the page would keep showing an old job.
+  // The server pings every 25 s; after 60 s of silence, reconnect, which also resends the full state.
+  for (const ev of ['state', 'job', 'setup', 'done', 'ping']) es.addEventListener(ev, () => { lastHeard = Date.now(); });
+  const watch = setInterval(() => {
+    if (Date.now() - lastHeard > 60000) { clearInterval(watch); es.close(); lastHeard = Date.now(); connect(); }
+  }, 10000);
   es.addEventListener('state', (e) => { S.state = JSON.parse(e.data); S.job = S.state.job; refresh(); });
   es.addEventListener('job', (e) => { S.job = JSON.parse(e.data); refresh(); });
   es.addEventListener('setup', (e) => { S.setupLog = JSON.parse(e.data); refresh(); });
@@ -523,6 +530,7 @@ VIEWS.project = {
       <div class="col">
         <p class="sr" aria-live="polite" data-region="liveStep"></p>
         <div data-region="progress" hidden></div>
+        <div data-region="bgswap"></div>
         <section class="panel"><h2 class="sub">Notes and replies</h2><div class="talk" data-region="talk"></div></section>
         <section class="panel">
           <div class="composer">
@@ -550,7 +558,7 @@ VIEWS.project = {
             <button class="btn primary" type="submit">Save name</button><button class="btn quiet" type="button" data-action="rename-cancel">Cancel</button></form>`
         : `<div class="title"><h1>${esc(p.title)}</h1><button class="btn quiet sm icon" data-action="rename" data-slug="${esc(slug)}" aria-label="Rename this video" title="Rename">${I.edit}</button></div>`;
       const src = p.sources.length > 1 ? `From ${plural(p.sources.length, 'clip')} · ` : p.sources.length ? `From ${esc(p.sources[0].split('/').pop())} · ` : '';
-      const forWho = `${p.contactLabel ? `${esc(p.contactLabel)} · ` : ''}${p.styleName ? `${esc(p.styleName)} style · ` : ''}`;
+      const forWho = `${p.clean ? 'Clean raw · ' : ''}${p.contactLabel ? `${esc(p.contactLabel)} · ` : ''}${p.styleName ? `${esc(p.styleName)} style · ` : ''}`;
       const del = S.job?.slug === slug || p.status === 'queued' ? '' : delBtn([{ area: 'project', path: slug }], `the video “${p.title}” and all its versions`, { label: 'Delete video' });
       return `${title}<div class="row spread"><p class="muted">${forWho}${src}${p.fromTerminal ? 'Edited in Claude · ' : ''}updated ${ago(p.updatedAt)}</p>${del}</div>`;
     },
@@ -618,7 +626,7 @@ VIEWS.project = {
       const p = proj(slug);
       const j = S.job;
       if (j && j.slug === slug) {
-        return progressPanel(j, { edit: p?.previewFirst ? 'Making your preview' : 'Editing your video', go: 'Building the full edit', final: 'Making the final version', horizontal: 'Making the YouTube version' }[j.kind] || 'Working on your notes');
+        return progressPanel(j, { edit: p?.previewFirst ? 'Making your preview' : 'Editing your video', go: 'Building the full edit', final: 'Making the final version', horizontal: 'Making the YouTube version', bgcheck: 'Checking your background photo' }[j.kind] || 'Working on your notes');
       }
       const q = S.state.queue.filter((x) => x.slug === slug);
       if (!q.length) return '';
@@ -641,6 +649,7 @@ VIEWS.project = {
       if (!items.length) return `<p class="muted">${p.fromTerminal ? 'This edit was made in the Claude chat. Notes you send here continue it.' : 'Nothing yet.'}</p>`;
       return items.join('');
     },
+    bgswap: bgPanel,
     liveStep: (slug) => (S.job?.slug === slug ? esc(S.job.steps.at(-1)?.label || '') : ''),
     target: (slug) => {
       const p = proj(slug);
@@ -662,6 +671,7 @@ VIEWS.project = {
     cutTick();
     for (const b of $$('[data-action="send-note"], [data-action="final"], [data-action="horizontal"]')) b.disabled = !p;
     for (const b of $$('[data-action="final"], [data-action="horizontal"]')) if (p && !p.versions.length) b.disabled = true;
+    for (const b of $$('[data-action="horizontal"]')) b.hidden = Boolean(p?.clean);
     const stamp = $('[data-action="stamp"]');
     const v = $('.monitor video');
     if (stamp) stamp.hidden = !v;
@@ -676,6 +686,67 @@ VIEWS.project = {
   },
 };
 const proj = (slug) => S.state.projects.find((p) => p.slug === slug);
+
+// ---------- replace background (clean raw videos only) ----------
+// Free steps (photo, check, prices) run on a click. Paid steps ask first with the exact credits.
+const BG_VERDICT = { good: 'Looks right', fixable: 'Fixable', bad: 'Not usable' };
+const bgModelName = { kling: 'Kling 4.0', seedance: 'Seedance 2.5' };
+function bgPanel(slug) {
+  const p = proj(slug);
+  if (!p?.clean || !p.versions.some((v) => /^(v\d+|final)$/.test(v.label))) return '';
+  const b = p.bg || {};
+  // Optional step: without Higgsfield on this computer there is nothing to press, so just say it can be skipped.
+  if (!S.state.setup.higgsfield && !Object.keys(b.runs || {}).length) {
+    return `<section class="panel"><div class="panel-head"><h2 class="sub">${I.image} Replace background <span class="muted small">(optional)</span></h2></div>
+      <p class="muted small" style="margin-top:6px">Needs a Higgsfield account, which is not set up on this computer. You can skip it: your clean video is ready to use as it is.</p></section>`;
+  }
+  const v = `?v=${b.stamp || 0}-${b.check ? 1 : 0}`;
+  const file = (f) => `/bgfile/${enc(slug)}/${f.split('/').map(enc).join('/')}${v}`;
+  const checking = (S.job?.slug === slug && S.job.kind === 'bgcheck') || S.state.queue.some((q) => q.slug === slug && q.type === 'bgcheck');
+  const working = b.busy ? `<p class="small"><span class="live"></span> ${esc(b.busy)}…</p>` : '';
+  const c = b.check;
+  const step1 = `<div class="bg-step"><h3 class="sub">1. Background photo</h3>
+    ${b.photo ? `<div class="bg-pics"><figure><img src="${file(b.photo)}" alt="Your background photo"><figcaption>Your photo</figcaption></figure>
+      ${b.reference ? `<figure><img src="${file(b.reference)}" alt="What the AI will use"><figcaption>${b.plate ? 'Angle-matched' : 'What the AI uses'}</figcaption></figure>` : ''}</div>` : '<p class="muted small">A photo of the room you want behind you. The check tells you if its angle and light fit your video.</p>'}
+    <div class="row"><button class="btn sm" data-action="bg-photo" data-slug="${esc(slug)}">${I.image} ${b.photo ? 'Change photo' : 'Add background photo'}</button>
+      ${b.photo ? `<button class="btn sm${c ? '' : ' primary'}" data-action="bg-check" data-slug="${esc(slug)}" ${checking ? 'disabled' : ''}>${checking ? 'Checking…' : c ? 'Check again' : 'Check background'}</button><span class="muted small">Free</span>` : ''}</div>
+    ${c ? `<div><span class="verdict ${esc(c.verdict)}">${esc(BG_VERDICT[c.verdict] || c.verdict)}</span>
+      <ul class="small" style="margin:8px 0 0 18px">${(c.points || []).map((t) => `<li>${esc(t)}</li>`).join('')}</ul>
+      ${c.fix ? `<p class="small" style="margin-top:6px"><b>Fix:</b> ${esc(c.fix)}</p>` : ''}</div>
+      ${c.verdict !== 'good' ? `<div class="row"><button class="btn sm" data-action="bg-plate" data-slug="${esc(slug)}" ${b.busy ? 'disabled' : ''}>Make an angle-matched background</button><span class="muted small">Costs a few credits; you see the price first</span></div>` : ''}` : ''}
+  </div>`;
+  const q = b.quote;
+  const runs = Object.entries(b.runs || {});
+  const step2 = c && b.reference ? `<div class="bg-step"><h3 class="sub">2. Pick model and quality</h3>
+    ${q ? `<p class="muted small">${plural(q.chunks, 'part')}, ${fmtDur(q.seconds)} in total. Your balance: <b>${esc(q.balance)}</b> credits.</p>
+      <table class="bg-price"><tbody>${q.rows.map((r) => `<tr><td><label class="row" style="gap:8px"><input type="checkbox" name="bgpick" value="${esc(r.model)}|${esc(r.res)}">${esc(r.name)}</label></td><td>${esc(r.res)}</td><td class="num">${esc(r.total)} credits</td></tr>`).join('')}</tbody></table>
+      <label class="field"><span>Prompt <span class="hint">(the same for every part, so the room matches)</span></span><textarea id="bg-prompt">${esc(b.prompt)}</textarea></label>
+      <div class="row"><button class="btn primary" data-action="bg-generate" data-slug="${esc(slug)}">${I.play} Generate…</button><span class="muted small">Each model runs one part at a time. You confirm the total first.</span></div>`
+    : `<div class="row"><button class="btn sm primary" data-action="bg-prices" data-slug="${esc(slug)}" ${b.busy ? 'disabled' : ''}>Get prices</button><span class="muted small">Free. Splits your video at pauses and asks Higgsfield for each price.</span></div>`}
+  </div>` : '';
+  const runHtml = ([key, r]) => {
+    const name = `${bgModelName[r.model] || r.model} ${r.res}`;
+    const row = q?.rows.find((x) => x.model === r.model && x.res === r.res);
+    const state = r.status === 'running' ? `<span class="live"></span> Part ${Math.min(r.done + 1, r.total)} of ${r.total}…`
+      : r.status === 'done' ? `${I.check} Saved as <b>${esc(tapeLabel(r.version.replace(/^.*-(bg-[a-z]+-v\d+)\.mp4$/, '$1')))}</b> above`
+      : r.status === 'interrupted' ? 'Stopped when the app closed.' : `<span class="bg-flag">${esc(r.error || 'Stopped.')}</span>`;
+    const again = ['interrupted', 'error'].includes(r.status)
+      ? `<button class="btn sm" data-action="bg-again" data-slug="${esc(slug)}" data-key="${esc(key)}">${I.retry} Continue</button>` : '';
+    const flagged = (r.report || []).filter((x) => x.flags?.length);
+    const parts = r.status === 'done' ? `
+      ${r.boundaries?.length ? `<p class="small muted">Where parts meet (left: end of one part, right: start of the next). The room should not jump.</p>
+        <div class="bg-pics wide">${r.boundaries.map((f) => `<figure><img src="${file(`runs/${key}/boundaries/${f}`)}" alt="Where parts meet: ${esc(f.replace(/\D+/g, ' ').trim().replace(' ', ' and '))}" loading="lazy"><figcaption>Parts ${esc(f.replace(/\D+/g, ' ').trim().replace(' ', ' → '))}</figcaption></figure>`).join('')}</div>` : ''}
+      ${flagged.length ? `<ul class="small bg-flag" style="margin-left:18px">${flagged.map((x) => `<li>${esc(x.chunk.replace(/\.mp4$/, '').replace('chunk_', 'Part '))}: ${esc(x.flags.join('; '))}</li>`).join('')}</ul>` : '<p class="small">Lips stay in sync in every part.</p>'}
+      <details><summary class="small">Redo one part</summary><div class="row" style="flex-wrap:wrap;margin-top:8px">${(r.report || []).map((x, i) => {
+        const id = x.chunk.replace(/\.mp4$/, '');
+        return `<button class="btn sm" data-action="bg-again" data-slug="${esc(slug)}" data-key="${esc(key)}" data-chunk="${esc(id)}" data-cost="${esc(row?.perChunk[i] ?? '')}">Part ${i + 1}${row ? ` · ${esc(row.perChunk[i])} credits` : ''}</button>`;
+      }).join('')}</div></details>` : '';
+    return `<div class="bg-run"><b>${esc(name)}</b><p class="small">${state}</p>${again ? `<div class="row">${again}</div>` : ''}${parts}</div>`;
+  };
+  const step3 = runs.length ? `<div class="bg-step"><h3 class="sub">3. Results</h3>${runs.map(runHtml).join('')}</div>` : '';
+  return `<section class="panel"><div class="panel-head"><h2 class="sub">${I.image} Replace background <span class="muted small">(optional)</span></h2></div>
+    ${b.error ? `<p class="small bg-flag" role="alert">${esc(b.error)}</p>` : ''}${working}${step1}${step2}${step3}</section>`;
+}
 const cutLabel = (c) => `Removing <b class="num">${fmtClock(c.from)}</b> to <b class="num">${fmtClock(c.to)}</b> (${(c.to - c.from).toFixed(1)} seconds)`;
 const openCut = () => { const r = route(); return r.name === 'project' ? S.cut[r.arg] : null; };
 // While a cut is open: moves the playhead on the cut bar, and during Preview jumps over the red part.
@@ -1297,27 +1368,32 @@ function openEditDialog(files) {
       <button class="btn quiet icon" type="button" data-action="close-modal" aria-label="Close">${I.x}</button></div>
     <ol class="clipstrip" data-strip>${stripHtml()}</ol>
     ${n > 1 ? '<label class="tick"><input type="checkbox" data-action="keep-order"><span>Keep the order I picked</span><small>Only if the editor gets it wrong</small></label>' : ''}
-    <fieldset class="q contact-pick"><legend><h3>Who is this video for?</h3></legend><p>This decides the contact part at the end.</p>
+    <fieldset class="q"><legend><h3>What kind of edit?</h3></legend><p>Pick clean raw when you only want the cuts, for example before replacing the background.</p>
+      <div class="opts">
+        <label class="opt"><input type="radio" name="kind" value="full" data-action="edit-kind" checked><span><b>Full edit</b><small>Captions, graphics, zoom-ins and sound, in your style</small></span></label>
+        <label class="opt"><input type="radio" name="kind" value="clean" data-action="edit-kind"><span><b>Clean raw</b><small>Only cuts silences and mistakes and cleans up the voice. No captions, graphics, transitions, sound effects or music</small></span></label>
+      </div></fieldset>
+    <fieldset class="q contact-pick full-only"><legend><h3>Who is this video for?</h3></legend><p>This decides the contact part at the end.</p>
       <div class="opts">
         <label class="opt"><input type="radio" name="contact" value="all" ${last === 'all' ? 'checked' : ''}><span><b>All sales</b><small>${contact ? `Ends with ${esc(contact.name || 'the brand contact')}` : 'No brand contact yet, so it ends with the logo'}</small></span></label>
         ${people.map((p) => `<label class="opt"><input type="radio" name="contact" value="${esc(p.id)}" ${last === p.id ? 'checked' : ''}><span><b>${esc(p.onScreen)}</b><small>${p.lines.length ? esc(p.lines.map((l) => l.label).join(' · ')) : 'No numbers yet'}${p.fb ? ' · Facebook' : ''}</small></span></label>`).join('')}
       </div>
       <a class="small" href="#/brand" data-jump="brand-details">${people.length ? 'Add or change sales people' : 'Add a sales person'} in My brand</a>
     </fieldset>
-    ${styles.length ? `<fieldset class="q style-pick"><legend><h3>Which style?</h3></legend><p>How this video should look.</p>
+    ${styles.length ? `<fieldset class="q style-pick full-only"><legend><h3>Which style?</h3></legend><p>How this video should look.</p>
       <div class="opts">
         <label class="opt"><input type="radio" name="style" value="" ${lastStyle ? '' : 'checked'}><span><b>${esc(mainStyleName())}</b><small>${S.state.setup.style ? 'Your main style' : 'Not set yet, so the editor uses its own'}</small></span></label>
         ${styles.map((x) => `<label class="opt"><input type="radio" name="style" value="${esc(x.id)}" ${lastStyle === x.id ? 'checked' : ''}><span>${x.frames[0] ? `<img class="opt-frame" src="${frameSrc(x, x.frames[0])}" alt="">` : ''}<b>${esc(x.name)}</b><small>Learned from a video</small></span></label>`).join('')}
       </div>
       <a class="small" href="#/style">See my styles</a>
     </fieldset>` : ''}
-    <fieldset class="q"><legend><h3>Preview first</h3></legend><p>Check the look before the full edit is made.</p>
+    <fieldset class="q full-only"><legend><h3>Preview first</h3></legend><p>Check the look before the full edit is made.</p>
       <label class="tick"><input type="checkbox" name="preview">Show me a preview first<small>A storyboard and a 5-second sample. Worth it for a new style; skip it for a style you trust.</small></label>
     </fieldset>
-    <fieldset class="q"><legend><h3>Sound effects</h3></legend><p>Makes the video feel lively.</p>
+    <fieldset class="q full-only"><legend><h3>Sound effects</h3></legend><p>Makes the video feel lively.</p>
       <label class="tick"><input type="checkbox" name="sfx" checked>Add sound effects<small>Whooshes, pops and dings on cuts and graphics</small></label>
     </fieldset>
-    <fieldset class="q music-pick"><legend><h3>Background music</h3></legend><p>A quiet music bed under your voice.</p>
+    <fieldset class="q music-pick full-only"><legend><h3>Background music</h3></legend><p>A quiet music bed under your voice.</p>
       <div class="opts">
         <label class="opt"><input type="radio" name="music" value="none" checked><span><b>No music</b><small>Voice (and effects) only</small></span></label>
         <label class="opt"><input type="radio" name="music" value=""><span><b>Let the editor choose</b><small>${sounds.length ? 'Uses your My brand music when the style wants music' : 'Makes or skips music to fit the style'}</small></span></label>
@@ -1328,7 +1404,7 @@ function openEditDialog(files) {
     <label class="field"><span>Name this video <span class="hint">(optional, so you can find it later)</span></span><input type="text" name="name" maxlength="80" placeholder="e.g. Why buy your car with us" autocomplete="off"></label>
     <label class="field"><span>Anything special for this video? <span class="hint">(optional)</span></span>
       <textarea name="instructions" placeholder="e.g. This is a promo for our new branch."></textarea></label>
-    <details class="more"><summary>${I.right}B-roll, pictures and sounds</summary><div style="display:grid;gap:16px">
+    <details class="more full-only"><summary>${I.right}B-roll, pictures and sounds</summary><div style="display:grid;gap:16px">
       <p class="small ${lib ? '' : 'muted'}">${lib ? `${I.check} Your brand's B-roll library (${plural(lib, 'clip')}) is used automatically.` : 'Tip: add B-roll in <a href="#/brand">My brand</a> so every video can use it.'}</p>
       ${brandImgs.length ? `<div><p class="small muted" style="margin-bottom:8px">Pictures from My brand — tick the ones to use and say what each is for:</p><div class="asset-list">${brandImgs.map((x) => assetRow(`image:${x.name}`, x.name, `/media/brand/images/${enc(x.name)}?t=${Math.round(x.mtime)}`)).join('')}</div></div>` : ''}
       ${sounds.length ? `<div><p class="small muted" style="margin-bottom:8px">Sounds from My brand — tick one and say what it's for (e.g. a voiceover line):</p><div class="asset-list">${sounds.map((f) => assetRow(`sound:${f.folder ? `${f.folder}/${f.name}` : f.name}`, f.folder ? `${f.folder} / ${f.name}` : f.name, null)).join('')}</div></div>` : ''}
@@ -1533,6 +1609,13 @@ $('#clip-picker').addEventListener('change', async (e) => {
   if (r.error) return toast(r.error, { bad: true, ms: 9000 });
   S.sel[c.slug] = r.file; refresh(); toast('Done. This is the new version.');
 });
+$('#bg-picker').addEventListener('change', async (e) => {
+  const file = e.target.files[0], slug = S.bgSlug;
+  e.target.value = '';
+  if (!file || !slug) return;
+  const r = await sendFile(`/api/projects/${slug}/bg/photo?name=${enc(file.name)}`, file, 'Adding');
+  if (r.error) toast(r.error, { bad: true, ms: 9000 }); else toast('Photo added. Press Check background.');
+});
 $('#brand-picker').addEventListener('change', (e) => {
   const p = S.brandPick;
   if (p && e.target.files.length) upload(e.target.files, 'brand', `&slot=${p.slot}${p.category ? `&category=${enc(p.category)}` : ''}`);
@@ -1571,6 +1654,36 @@ const ACTIONS = {
     S.pick = el.checked ? [...S.pick.filter((n) => n !== d.file), d.file] : S.pick.filter((n) => n !== d.file);
     refocusClip(d.file);
   },
+  'bg-photo': (d) => { S.bgSlug = d.slug; $('#bg-picker').click(); },
+  'bg-check': async (d) => { try { queuedToast(await api(`/api/projects/${d.slug}/bg/check`, { body: {} })); } catch (e) { fail(e); } },
+  'bg-prices': (d) => api(`/api/projects/${d.slug}/bg/prices`, { body: {} }).catch(fail),
+  'bg-plate': async (d, el) => {
+    el.disabled = true;
+    try {
+      const { credits } = await api(`/api/projects/${d.slug}/bg/plate-price`, { body: {} });
+      if (await ask({ title: `Spend ${credits} credits?`, body: 'Makes an empty-room version of your photo, seen from your video\'s camera angle (Nano Banana 2.1, 2k). Then check it again before generating.', ok: `Spend ${credits} credits` })) {
+        await api(`/api/projects/${d.slug}/bg/plate`, { body: {} });
+      }
+    } catch (e) { fail(e); }
+    el.disabled = false;
+  },
+  'bg-generate': async (d) => {
+    const p = proj(d.slug);
+    const picks = $$('input[name="bgpick"]:checked').map((x) => { const [model, res] = x.value.split('|'); return { model, res }; });
+    if (!picks.length) return toast('Tick at least one model first.', { bad: true });
+    const rows = picks.map((k) => p.bg.quote.rows.find((r) => r.model === k.model && r.res === k.res));
+    const total = Math.round(rows.reduce((a, r) => a + r.total, 0) * 100) / 100;
+    if (!await ask({ title: `Spend ${total} credits?`, body: `${rows.map((r) => `${r.name} ${r.res}: ${r.total}`).join(' · ')}. Your balance: ${p.bg.quote.balance}. Each model does one part at a time; this takes a while.`, ok: `Spend ${total} credits` })) return;
+    try { await api(`/api/projects/${d.slug}/bg/generate`, { body: { picks, prompt: $('#bg-prompt')?.value || '' } }); toast('Started. You can leave this page; it keeps going.'); askNotify(); } catch (e) { fail(e); }
+  },
+  'bg-again': async (d) => {
+    const ok = d.chunk
+      ? await ask({ title: `Redo this part for ${d.cost || 'a few'} credits?`, body: 'Only this part is made again. The other parts are kept, and you get a new version.', ok: `Spend ${d.cost || ''} credits`.trim() })
+      : await ask({ title: 'Continue this run?', body: 'Finishes the parts you already paid for and approved. Parts that were already done are not made again.', ok: 'Continue' });
+    if (!ok) return;
+    try { await api(`/api/projects/${d.slug}/bg/again`, { body: { key: d.key, chunk: d.chunk || null } }); } catch (e) { fail(e); }
+  },
+  'edit-kind': (d, el) => { for (const f of $$('.full-only', el.form)) f.hidden = el.value === 'clean'; },
   'pick-new': () => { S.pick = videosIn('').filter((f) => !f.edited).map((f) => f.path); refresh(); },
   'pick-folder': (d) => { S.pick = videosIn(d.name).map((f) => f.path); refresh(); },
   'folder-video': (d) => { S.pick = videosIn(d.name).map((f) => f.path); refresh(); openEditDialog(S.pick); },
@@ -1904,6 +2017,7 @@ document.addEventListener('submit', async (e) => {
         instructions: fd.get('instructions') || '', broll: fd.getAll('broll'), extra: fd.getAll('extra'),
         contact: fd.get('contact') && fd.get('contact') !== 'all' ? { type: 'person', id: fd.get('contact') } : { type: 'all' },
         style: fd.get('style') || '', music: fd.get('music') || '', sfx: fd.get('sfx') === 'on', assets, preview: fd.get('preview') === 'on',
+        clean: fd.get('kind') === 'clean',
       } });
       try { localStorage.setItem('f247.contact', fd.get('contact') || 'all'); localStorage.setItem('f247.style', fd.get('style') || ''); } catch {}
       $('#modal').close();
