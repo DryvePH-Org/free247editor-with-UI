@@ -8,10 +8,10 @@ Per chunk: measure picture offset vs the source chunk for each part between the 
 cut hides the shift), force 30fps 1080x1920, fit to the source chunk's exact length, drop generated audio. Then concat, lay the edited audio on top, and
 save a still from each side of every boundary to <final dir>/boundaries/.
 """
-import json, os, subprocess, sys
+import json, os, statistics, subprocess, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sync import measure, motion, best_lag, RATE  # noqa: E402
+from sync import measure, motion, best_lag, pick, sound, FACE, RATE  # noqa: E402
 
 edited, chunks_json, gen_dir, final = sys.argv[1:5]
 crop = tuple(map(float, sys.argv[sys.argv.index("--crop") + 1].split(","))) if "--crop" in sys.argv else (0.2, 0.15, 0.6, 0.7)
@@ -30,30 +30,51 @@ for c in json.load(open(chunks_json)):
     a, b = motion(c["file"], crop), motion(gen, crop)
     lag = best_lag(a, b, 0.1, min(len(a), len(b)) / RATE - 0.1)[0]
     bounds = [0.0] + [x - c["start"] for x in cuts if c["start"] + 0.05 < x < c["end"] - 0.05] + [dur]
-    lags = []
-    for s0, s1 in zip(bounds, bounds[1:]):
-        L, corr = best_lag(a, b, s0 + 0.05, s1 - 0.05, maxlag=1.5, minlen=0.4)
-        if corr >= 0.6: lag = L  # weak match -> keep the previous part's shift
-        lags.append(round(lag * 30) / 30)  # whole frames, so every part keeps its exact length
-    # picture late by L -> take generated [s0+L, s1+L); 2 s of cloned frames on each end cover the edges.
-    # Bounds sit half a frame early so each trim falls between frames.
+    # Three independent votes per part: lips, whole body, and the model's own sound. Body motion alone
+    # once matched a hand gesture 0.9 s off; the votes outvote any single wrong one.
+    pairs = [(motion(c["file"], FACE), motion(gen, FACE)), (a, b), (sound(c["file"]), sound(gen))]
+    def votes(s0, s1):
+        return [best_lag(x, y, s0 + 0.05, s1 - 0.05, maxlag=1.5, minlen=0.4) for x, y in pairs if x and y]
+    est = [votes(s0, s1) for s0, s1 in zip(bounds, bounds[1:])]
+    # the model's picture sits a fixed time off its own sound (Kling: ~80 ms); measure it where lips and sound both match
+    gaps = [e[0][0] - e[2][0] for e in est if len(e) == 3 and e[0][1] >= 0.6 and e[2][1] >= 0.6]
+    gap = statistics.median(gaps) if gaps else 0.0
+    vote = lambda e, prev, good=0.6: pick([(L + gap, cr) if i == 2 else (L, cr) for i, (L, cr) in enumerate(e)], prev, good)
+    lags = []  # (shift at part start, shift at part end)
+    for (s0, s1), e in zip(zip(bounds, bounds[1:]), est):
+        lag = vote(e, lag)
+        L0 = L1 = round(lag * 30) / 30  # whole frames when not ramping
+        if s1 - s0 >= 4:  # models also run slow inside a long part (Kling: +0.4 s over 8 s), so fit a line through ~2 s windows
+            n = int((s1 - s0) // 2); w = (s1 - s0) / n
+            pts = [(s0 + (j + 0.5) * w, v) for j in range(n) for v in [vote(votes(s0 + j * w, s0 + (j + 1) * w), None, 0.75)] if v is not None]
+            if len(pts) >= 2:
+                mt = sum(t for t, _ in pts) / len(pts); mv = sum(v for _, v in pts) / len(pts)
+                k = sum((t - mt) * (v - mv) for t, v in pts) / sum((t - mt) ** 2 for t, _ in pts)
+                if abs(k) * (s1 - s0) >= 2 / 30:
+                    L0, L1 = mv + k * (s0 - mt), mv + k * (s1 - mt)
+                    lag = L1
+        lags.append((L0, L1))
+    # picture late by L -> take generated [s0+L0, s1+L1), stretched to the part's exact length;
+    # 2 s of cloned frames on each end cover the edges. Bounds sit half a frame early so each trim falls between frames.
     h = 0.5 / 30
-    parts = "".join(f"[s{i}]trim=start={s0 + L + 2 - h:.4f}:end={s1 + L + 2 - h:.4f},setpts=PTS-STARTPTS[p{i}];"
-                    for i, (s0, s1, L) in enumerate(zip(bounds, bounds[1:], lags)))
+    parts = "".join(f"[s{i}]trim=start={s0 + L0 + 2 - h:.4f}:end={s1 + L1 + 2 - h:.4f},"
+                    f"setpts=(PTS-STARTPTS)*{(s1 - s0) / (s1 - s0 + L1 - L0):.6f},fps=30,"
+                    f"tpad=stop_mode=clone:stop_duration=0.2,trim=end_frame={round((s1 - s0) * 30)}[p{i}];"
+                    for i, (s0, s1, (L0, L1)) in enumerate(zip(bounds, bounds[1:], lags)))
     k = len(lags)
     n = os.path.join(work, name)
     subprocess.run(ff + ["-i", gen, "-an", "-filter_complex",
                    "[0:v]fps=30,scale=1080:1920:flags=lanczos,setsar=1,tpad=start_mode=clone:start_duration=2:"
                    f"stop_mode=clone:stop_duration=2,split={k}" + "".join(f"[s{i}]" for i in range(k)) + ";" + parts
                    + "".join(f"[p{i}]" for i in range(k)) + f"concat=n={k}:v=1:a=0,tpad=stop_mode=clone:stop_duration=1,"
-                   f"trim=duration={dur},setpts=PTS-STARTPTS,format=yuv420p[v]", "-map", "[v]",
+                   f"trim=end_frame={round(dur * 30)},setpts=PTS-STARTPTS,format=yuv420p[v]", "-map", "[v]",
                    "-c:v", "libx264", "-preset", "medium", "-crf", "16", n], check=True)
     norm.append(n)
     m = measure(c["file"], n, crop)  # what is left after the fix
     flag = []
     if abs(m["drift_ms"]) > 40: flag.append("DRIFTS (lips slide out of sync inside the chunk)")
     if m["match"] < 0.5: flag.append("LOW MATCH (motion differs from source, check face/gestures)")
-    report.append({"chunk": name, **m, "shifts_ms": [round(x * 1000) for x in lags], "flags": flag})
+    report.append({"chunk": name, **m, "shifts_ms": [round((a + b) * 500) for a, b in lags], "flags": flag})
     print(f"{name}: offset {m['offset_ms']:+d} ms, drift {m['drift_ms']:+d} ms, match {m['match']}  {' '.join(flag)}")
 
 lst = os.path.join(work, "list.txt")

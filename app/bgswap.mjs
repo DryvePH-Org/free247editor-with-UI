@@ -18,7 +18,7 @@ export const RESOLUTIONS = ['720p', '1080p'];
 // Longest part, in seconds (Kling and Seedance allow 3-30 s); fewer parts mean fewer joins.
 // Changing this re-splits a video on its next "Get prices".
 const PART_MAX = 30;
-const PLATE_MODEL = 'nano_banana_2_1';
+const PLATE_MODEL = 'nano_banana_pro'; // the team has Nano Banana Pro Unlimited (2K)
 const PLATE_PROMPT = 'Image 1 shows the camera: its position, height, angle and lens. Image 2 shows a room. Make a photo of the ' +
   'empty room from image 2, taken from exactly the camera position, height, angle and lens of image 1, with the main seat where ' +
   'the person sits in image 1. Keep the room\'s furniture, walls, objects and light. No people. No coffee table or other objects ' +
@@ -79,13 +79,14 @@ export function createBgSwap({ root, onChange }) {
     return {
       photo: st.photo || null, check: readJson(join(d, 'check.json'), null), prompt: readText(join(d, 'prompt.txt')).trim(),
       reference: existsSync(join(d, reference(slug))) ? reference(slug) : null, plate: existsSync(join(d, 'plate.png')),
+      platePrompt: readText(join(d, 'plate_prompt.txt')).trim(), cameraFrame: existsSync(join(d, 'camera_frame.jpg')),
       quote: (st.partMax === PART_MAX && st.quote) || null, runs: /* prices for an older split are stale */ st.runs || {}, busy: busy.get(slug) || null, error: st.error || null, stamp: st.stamp || 0,
     };
   }
 
   function photoSaved(slug, name) {
     const d = dirOf(slug);
-    for (const f of ['check.json', 'prompt.txt', 'background_9x16.png', 'plate.png']) rmSync(join(d, f), { force: true });
+    for (const f of ['check.json', 'prompt.txt', 'background_9x16.png', 'plate.png', 'plate_prompt.txt', 'camera_frame.jpg']) rmSync(join(d, f), { force: true });
     for (const f of readdirSync(d)) if (/^photo\./.test(f) && f !== name) rmSync(join(d, f), { force: true });
     update(slug, (st) => { st.photo = name; st.stamp = Date.now(); delete st.quote; delete st.refUpload; });
   }
@@ -133,7 +134,9 @@ export function createBgSwap({ root, onChange }) {
   // A frame of the clean video shows the model the camera angle to match.
   const cameraFrame = (slug, source) => run('ffmpeg', ['-y', '-v', 'error', '-ss', '2', '-i', source.path, '-frames:v', '1', '-q:v', '2',
     join(dirOf(slug), 'camera_frame.jpg')]);
-  const plateArgs = (slug) => ['--prompt', PLATE_PROMPT, '--aspect_ratio', '9:16', '--resolution', '2k',
+  // The check's prompt fixes this photo's own problems (desk in front, light); the generic one is the fallback.
+  const platePrompt = (slug) => readText(join(dirOf(slug), 'plate_prompt.txt')).trim() || PLATE_PROMPT;
+  const plateArgs = (slug) => ['--prompt', platePrompt(slug), '--aspect_ratio', '9:16', '--resolution', '2k',
     '--image-references', join(dirOf(slug), 'camera_frame.jpg'), '--image-references', join(dirOf(slug), load(slug).photo)];
   const platePrice = async (slug, source) => {
     if (!load(slug).photo) throw new Error('Add a background photo first.');
@@ -147,7 +150,7 @@ export function createBgSwap({ root, onChange }) {
     await cameraFrame(slug, source);
     const out = await run('higgsfield', ['generate', 'create', PLATE_MODEL, ...plateArgs(slug), '--json']);
     const id = JSON.parse(out)[0];
-    log(slug, `\n## Angle-matched background ${new Date().toISOString()}\n- model ${PLATE_MODEL}, 2k, 9:16, job ${id}\n- prompt: ${PLATE_PROMPT}`);
+    log(slug, `\n## Angle-matched background ${new Date().toISOString()}\n- model ${PLATE_MODEL}, 2k, 9:16, job ${id}\n- prompt: ${platePrompt(slug)}`);
     const job = JSON.parse(await run('higgsfield', ['generate', 'wait', id, '--timeout', '20m', '--json']));
     if (job.status !== 'completed' || !job.result_url) throw new Error(`The background job ended: ${job.status}.`);
     await run('curl', ['-sSfL', '-o', join(d, 'plate.png'), job.result_url]);

@@ -14,8 +14,6 @@ const S = {
   setupLog: null,
   sel: {},          // selected version per project
   noteTarget: {},   // 'vertical' | 'horizontal' per project
-  cut: {},          // { file, from, to, dur, busy, preview } per project while a cut is being marked
-  clipAt: null,     // { slug, at, file } while picking a clip to put in
   pick: [],         // inbox clips picked for the next video, in the order they were picked
   dialog: null,     // { files, keep } while the new-video dialog is open
   brandPick: null,  // { slot, category } for the brand file picker
@@ -168,6 +166,7 @@ function onDone(d) {
   else if (d.kind === 'setup') toast(d.error ? 'Setup ran into a problem. Open Setup to read why.' : 'Setup check finished.', { bad: d.error, link: { href: '#/setup', label: 'Open' }, ms: 9000 });
   else if (d.error) toast(`${name}: the editor ran into a problem. Open it to see what happened.`, { bad: true, link: d.slug ? { href: `#/p/${d.slug}`, label: 'Open' } : null, ms: 10000 });
   else if (d.text?.startsWith('Stopped')) toast('Stopped.');
+  else if (d.kind === 'fix') toast(`${name}: the fixed part is going back in. The new version is ready in a moment.`, { link: d.slug ? { href: `#/p/${d.slug}`, label: 'Read' } : null, ms: 9000 });
   else if (d.kind !== 'style' && !d.newVersion) toast(`The editor replied about ${name}.`, { link: d.slug ? { href: `#/p/${d.slug}`, label: 'Read' } : null, ms: 9000 });
   else if (d.kind !== 'style') toast(`${name} is ready to watch.`, { link: d.slug ? { href: `#/p/${d.slug}`, label: 'Watch' } : null, ms: 9000 });
   else toast(d.styleId ? `${styleName} was updated.` : 'Your style was updated.');
@@ -199,10 +198,12 @@ function refresh() {
   const r = route();
   const key = `${r.name}:${r.arg || ''}`;
   if (key !== current.key) {
+    current.view?.leave?.();
     current = { key, view: VIEWS[r.name] || VIEWS.studio };
+    document.body.classList.toggle('editing', r.name === 'edit');
     regionCache.clear();
     $('#main').innerHTML = current.view.layout(r.arg);
-    for (const a of $$('.nav')) if (a.dataset.nav === ({ project: 'videos', folder: 'studio' }[r.name] || r.name)) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+    for (const a of $$('.nav')) if (a.dataset.nav === ({ project: 'videos', edit: 'videos', folder: 'studio' }[r.name] || r.name)) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
     window.scrollTo(0, 0);
     current.view.enter?.(r.arg);
   }
@@ -576,25 +577,16 @@ VIEWS.project = {
       if (pv?.video && S.job?.slug !== slug) return `<video controls playsinline preload="metadata" src="/media/outbox/${enc(pv.video)}?t=${Math.round(pv.mtime)}" poster="/thumb/outbox/${enc(pv.video)}?t=${Math.round(pv.mtime)}"></video>`;
       if (S.job?.slug === slug && p?.previewFirst && S.job.kind !== 'go') return `<div class="waiting"><span class="live"></span><b>Your preview is on its way.</b><span>A storyboard and a 5-second sample, so you can check the look before the full edit.</span></div>`;
       if (S.job?.slug === slug) return `<div class="waiting"><span class="live"></span><b>Your first draft is on its way.</b><span>Most videos take 10 to 30 minutes. You can leave this page; you'll get a notice when it's ready.</span></div>`;
+      if (p?.status === 'manual') return `<div class="waiting"><b>Ready for your changes.</b><span>Zoom, cut and add clips in the editor, then press Auto edit.</span><a class="btn" href="#/edit/${enc(slug)}">${I.film} Open in editor</a></div>`;
       if (p?.status === 'queued') return `<div class="waiting"><b>Waiting in line.</b><span>The editor starts this as soon as it finishes what it's doing.</span></div>`;
       return `<div class="waiting"><b>No video yet.</b><span>${p?.status === 'error' || p?.status === 'interrupted' ? 'The last run did not finish. See the reply on the right.' : ''}</span></div>`;
     },
     under: (slug) => {
       const p = proj(slug);
       const v = p && selected(p);
-      const cut = S.cut[slug];
-      const handle = (end, label) => `<input type="range" class="cut-handle" data-cut-handle="${end}" min="0" max="${cut.dur.toFixed(2)}" step="0.05" value="${cut[end].toFixed(2)}" aria-label="${label}"${cut.busy ? ' disabled' : ''}>`;
-      const quick = v && S.job?.slug !== slug && p.status !== 'queued' && !/final$/.test(v.label) ? `<div class="quick">
-        ${cut ? `<div class="cutter">
-          <p class="small">Drag the red handles to the start and end of the part to remove. The video shows where each handle is.</p>
-          <div class="cut-bar" style="--from:${cut.from / cut.dur};--to:${cut.to / cut.dur}"><div class="cut-range"></div><div class="cut-head"></div>${handle('from', 'Cut starts at')}${handle('to', 'Cut ends at')}</div>
-          <div class="row spread"><span class="small" data-cut-label>${cutLabel(cut)}</span><span class="row">
-            ${cut.busy ? `<button class="btn sm primary" disabled>Cutting… about half a minute</button>` : `<button class="btn quiet sm" data-action="cut-cancel" data-slug="${esc(slug)}">Cancel</button>
-            <button class="btn sm" data-action="cut-preview" data-slug="${esc(slug)}" title="Plays the video as if this part were already gone">${I.play} Preview</button>
-            <button class="btn sm primary" data-action="cut-end" data-slug="${esc(slug)}">${I.x} Cut it</button>`}</span></div></div>`
-        : `<button class="btn sm" data-action="cut-start" data-slug="${esc(slug)}" title="Mark a part of this version to remove">${I.x} Cut a part out</button>
-          <button class="btn sm" data-action="add-clip" data-slug="${esc(slug)}" title="Pause where the clip should go">${I.film} Add a clip here</button>
-          <span class="muted small">Made on this computer in seconds. No AI used.</span>`}</div>` : '';
+      const quick = v && S.job?.slug !== slug && p.status !== 'queued' ? `<div class="quick">
+        <button class="btn sm" data-action="open-editor" data-slug="${esc(slug)}" data-file="${esc(v.file)}">${I.film} Open in editor</button>
+        <span class="muted small">Zoom, cut and add clips yourself. No AI used.</span></div>` : '';
       return `${quick}${v ? `<a class="btn quiet sm" href="/media/outbox/${enc(v.file)}" download="${esc(v.file)}">${I.down} Download</a>
         <button class="btn quiet sm" data-action="reveal" data-area="outbox" data-name="${esc(v.file)}">${I.folder} Show in folder</button>
         ${S.job?.slug === slug || p.status === 'queued' ? '' : delBtn([{ area: 'version', path: v.file }], `version ${tapeLabel(v.label)}`, { label: 'Delete this version' })}` : ''}
@@ -668,7 +660,6 @@ VIEWS.project = {
   },
   after: (slug) => {
     const p = proj(slug);
-    cutTick();
     for (const b of $$('[data-action="send-note"], [data-action="final"], [data-action="horizontal"]')) b.disabled = !p;
     for (const b of $$('[data-action="final"], [data-action="horizontal"]')) if (p && !p.versions.length) b.disabled = true;
     for (const b of $$('[data-action="horizontal"]')) b.hidden = Boolean(p?.clean);
@@ -713,6 +704,16 @@ function bgPanel(slug) {
     ${c ? `<div><span class="verdict ${esc(c.verdict)}">${esc(BG_VERDICT[c.verdict] || c.verdict)}</span>
       <ul class="small" style="margin:8px 0 0 18px">${(c.points || []).map((t) => `<li>${esc(t)}</li>`).join('')}</ul>
       ${c.fix ? `<p class="small" style="margin-top:6px"><b>Fix:</b> ${esc(c.fix)}</p>` : ''}</div>
+      ${c.verdict !== 'good' && b.platePrompt && !b.plate ? `<div class="bg-free"><h3 class="sub">Make it yourself on Higgsfield <span class="muted small">(free with Nano Banana Pro Unlimited)</span></h3>
+        <ol class="small"><li>Open <a href="https://higgsfield.ai" target="_blank" rel="noopener">higgsfield.ai</a> and pick <b>Nano Banana Pro</b>, 2K, 9:16.</li>
+          <li>Add these two pictures, in this order:</li></ol>
+        <div class="bg-pics">${b.cameraFrame ? `<figure><a href="${file('camera_frame.jpg')}" download="1-camera.jpg"><img src="${file('camera_frame.jpg')}" alt="Picture 1: a frame of your video"></a><figcaption>1. Your video (camera)</figcaption></figure>` : ''}
+          <figure><a href="${file(b.photo)}" download="2-room${esc(b.photo.slice(b.photo.lastIndexOf('.')))}"><img src="${file(b.photo)}" alt="Picture 2: your room photo"></a><figcaption>2. Your room</figcaption></figure></div>
+        <p class="muted small">Click a picture to save it.</p>
+        <ol class="small" start="3"><li>Paste this prompt:</li></ol>
+        <textarea id="bg-plate-prompt" readonly rows="6">${esc(b.platePrompt)}</textarea>
+        <div class="row"><button class="btn sm" data-action="bg-copy-prompt">${I.copy} Copy prompt</button></div>
+        <ol class="small" start="4"><li>Save the picture it makes, press <b>Change photo</b> above, pick that picture, then <b>Check again</b>.</li></ol></div>` : ''}
       ${c.verdict !== 'good' ? `<div class="row"><button class="btn sm" data-action="bg-plate" data-slug="${esc(slug)}" ${b.busy ? 'disabled' : ''}>Make an angle-matched background</button><span class="muted small">Costs a few credits; you see the price first</span></div>` : ''}` : ''}
   </div>`;
   const q = b.quote;
@@ -747,48 +748,753 @@ function bgPanel(slug) {
   return `<section class="panel"><div class="panel-head"><h2 class="sub">${I.image} Replace background <span class="muted small">(optional)</span></h2></div>
     ${b.error ? `<p class="small bg-flag" role="alert">${esc(b.error)}</p>` : ''}${working}${step1}${step2}${step3}</section>`;
 }
-const cutLabel = (c) => `Removing <b class="num">${fmtClock(c.from)}</b> to <b class="num">${fmtClock(c.to)}</b> (${(c.to - c.from).toFixed(1)} seconds)`;
-const openCut = () => { const r = route(); return r.name === 'project' ? S.cut[r.arg] : null; };
-// While a cut is open: moves the playhead on the cut bar, and during Preview jumps over the red part.
-let cutLoop = false;
-function cutTick() {
-  if (cutLoop) return;
-  cutLoop = true;
-  const step = () => {
-    const c = openCut();
-    const v = $('.monitor video');
-    if (!c || !v) { cutLoop = false; return; }
-    $('.cut-bar')?.style.setProperty('--head', v.currentTime / c.dur);
-    if (c.preview) {
-      if (v.paused) c.preview = false;
-      else if (v.currentTime >= c.from && v.currentTime < c.to) v.currentTime = c.to;
-      else if (v.currentTime >= c.to + 2) { v.pause(); c.preview = false; }
-    }
-    requestAnimationFrame(step);
-  };
-  step();
-}
-// Dragging a cut handle: show that frame, and keep start before end.
-document.addEventListener('input', (e) => {
-  const h = e.target.closest?.('[data-cut-handle]');
-  const c = h && openCut();
-  if (!c) return;
-  const t = Number(h.value);
-  if (h.dataset.cutHandle === 'from') c.from = Math.min(t, c.to - 0.1);
-  else c.to = Math.max(t, c.from + 0.1);
-  h.value = c[h.dataset.cutHandle];
-  c.preview = false;
-  const v = $('.monitor video');
-  if (v) { v.pause(); v.currentTime = c[h.dataset.cutHandle]; }
-  const bar = $('.cut-bar');
-  bar.style.setProperty('--from', c.from / c.dur);
-  bar.style.setProperty('--to', c.to / c.dur);
-  $('[data-cut-label]').innerHTML = cutLabel(c);
-});
 function selected(p) {
   const file = S.sel[p.slug];
   return p.versions.find((v) => v.file === file) || [...p.versions].sort((a, b) => b.mtime - a.mtime)[0];
 }
+
+// ---------- manual editor: timeline math (pure; the scratchpad test slices this block out) ----------
+// Parts play in order; "output time" is time in the finished video, in/out are seconds of each part's source.
+const MIN_PART = 0.1;
+const r3 = (n) => Math.round(n * 1000) / 1000;
+const partLen = (p) => p.out - p.in;
+const totalLen = (parts) => parts.reduce((s, p) => s + partLen(p), 0);
+const partStart = (parts, i) => totalLen(parts.slice(0, i));
+// The part playing at output time t and how far into it. Past the end lands at the end of the last part.
+function locate(parts, t) {
+  let start = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const len = partLen(parts[i]);
+    if (t < start + len || i === parts.length - 1) return { i, start, off: Math.min(Math.max(0, t - start), len) };
+    start += len;
+  }
+  return null;
+}
+// Splits the part under t in two. Returns the right half's index, or -1 when t is too near an edge.
+function splitAt(parts, t) {
+  const L = locate(parts, t);
+  if (!L || L.off < MIN_PART || partLen(parts[L.i]) - L.off < MIN_PART) return -1;
+  const p = parts[L.i];
+  const cut = r3(p.in + L.off);
+  parts.splice(L.i, 1, { ...p, out: cut }, { ...p, in: cut });
+  return L.i + 1;
+}
+// Puts a part in at t: at a boundary goes between parts, inside a part splits it. Returns the new index.
+function insertAt(parts, t, part) {
+  const L = locate(parts, t);
+  let i = 0;
+  if (L && L.off < MIN_PART) i = L.i;
+  else if (L) { const r = splitAt(parts, t); i = r < 0 ? L.i + 1 : r; }
+  parts.splice(i, 0, part);
+  return i;
+}
+function trimPart(p, edge, value, duration) {
+  if (edge === 'in') p.in = r3(Math.min(Math.max(0, value), p.out - MIN_PART));
+  else p.out = r3(Math.max(Math.min(duration, value), p.in + MIN_PART));
+}
+const movePart = (parts, from, to) => parts.splice(to, 0, parts.splice(from, 1)[0]);
+// Where a part's picture sits in the W x H frame, as fractions of the frame. Zoom 1 = the source scaled to fill
+// the frame. x,y = the point of the source at the frame centre. At zoom 1 or more it is clamped so no empty edge
+// shows; under 1 it is not and the empty edge is black. Same rule as place() in app/editor.mjs.
+function place(part, src, W, H) {
+  const s = Math.max(W / src.width, H / src.height) * part.zoom;
+  const w = (src.width * s) / W, h = (src.height * s) / H;
+  const clamp = (v, size) => (part.zoom >= 1 ? Math.min(Math.max(v, 1 / (2 * size)), 1 - 1 / (2 * size)) : Math.min(Math.max(v, 0), 1));
+  const x = clamp(part.x, w), y = clamp(part.y, h);
+  return { w, h, x, y, left: 0.5 - x * w, top: 0.5 - y * h };
+}
+// Sound clips sit on the output timeline at `at`, playing in..out of their source, over the parts' own sound.
+const sndLen = (a) => a.out - a.in;
+const nextSoundId = (audio) => `a${Math.max(0, ...audio.map((a) => Number(String(a.id).slice(1)) || 0)) + 1}`;
+// Splits sound clip i at output time t. Returns the right half's index, or -1 when t is not well inside it.
+function splitSound(audio, i, t, id) {
+  const a = audio[i];
+  const off = t - a.at;
+  if (off < MIN_PART || sndLen(a) - off < MIN_PART) return -1;
+  const cut = r3(a.in + off);
+  audio.splice(i, 1, { ...a, out: cut }, { ...a, id, in: cut, at: r3(t) });
+  return i + 1;
+}
+// Dragging the left edge keeps the clip's end where it is in time (and never starts before 0:00); the right edge moves the end.
+function trimSound(a, edge, d, orig, duration) {
+  if (edge === 'in') { a.in = r3(Math.min(Math.max(0, orig.in + d, orig.in - orig.at), orig.out - MIN_PART)); a.at = r3(orig.at + a.in - orig.in); }
+  else a.out = r3(Math.max(Math.min(duration, orig.out + d), orig.in + MIN_PART));
+}
+// "Extract audio": part i's sound becomes a sound clip at the same place, and the part is muted.
+function extractAudio(parts, i, id) {
+  const p = parts[i];
+  const clip = { id, src: p.src, in: p.in, out: p.out, at: r3(partStart(parts, i)), volume: p.volume || 1 };
+  p.volume = 0;
+  return clip;
+}
+// Overlapping sound clips go on separate rows: each takes the first row that is free when it starts.
+function soundRows(audio) {
+  const ends = [], rows = [];
+  for (const i of audio.map((_, j) => j).sort((x, y) => audio[x].at - audio[y].at)) {
+    let r = ends.findIndex((e) => e <= audio[i].at + 1e-6);
+    if (r < 0) r = ends.length;
+    ends[r] = audio[i].at + sndLen(audio[i]);
+    rows[i] = r;
+  }
+  return rows;
+}
+// ---------- end of timeline math ----------
+
+// ---------- manual editor (#/edit/<slug>) ----------
+// One <video> per source; the one for the part under the playhead is shown, sized and moved by place().
+// Edits change E.parts / E.marks, then edCommit() keeps an undo step and saves a moment later.
+let E = null;
+const edSrc = (id) => E.sources.find((s) => s.id === id);
+const edVid = (id) => $$('[data-ed-frame] video').find((v) => v.dataset.src === id);
+const edTotal = () => totalLen(E.parts);
+const EI = {
+  split: icon('scissors'), pause: icon('pause'), undo: icon('arrow-counter-clockwise'), mark: icon('selection-plus'), zoom: icon('magnifying-glass-plus'),
+  reset: icon('frame-corners'), wave: icon('waveform'), addSound: icon('music-notes-plus'), note: icon('note-pencil'), vol: icon('speaker-low'),
+};
+const edJSON = () => JSON.stringify({ parts: E.parts, marks: E.marks, audio: E.audio });
+const pct = (v) => `${Math.round((v ?? 1) * 100)}%`;
+const edPreview = new Audio(); // "Listen" in the Add sound dialog
+
+VIEWS.edit = {
+  layout: (slug) => `<div class="ed">
+    <header class="ed-top">
+      <a class="btn quiet sm" href="#/p/${enc(slug)}">${I.left} Back to the video</a>
+      <h1>${esc(proj(slug)?.title || 'Editor')}</h1>
+      <span class="small ed-status" aria-live="polite" data-ed-status></span>
+      <div class="row">
+        <button class="btn sm" data-action="ed-render" disabled title="Makes a new version you can watch and download">${I.check} Save as new version</button>
+        <button class="btn sm primary" data-action="ed-auto" disabled title="The AI edits what you made here: captions, graphics and sound in your style">${I.star} Auto edit</button>
+      </div>
+    </header>
+    <div class="ed-body" data-ed-body><div class="ed-wait"><span class="live"></span><b>Opening the editor…</b></div></div>
+  </div>`,
+  enter: (slug) => {
+    E = { slug, sources: [], parts: [], marks: [], audio: [], sounds: [], frames: {}, sel: -1, mark: -1, snd: -1, panel: null, cur: -1, t: 0, pps: 20, playing: false,
+      rev: 0, savedRev: 0, saveP: Promise.resolve(), undo: [], snapAt: 0, marking: false, busy: '', ready: false };
+    edLoad();
+  },
+  leave: () => {
+    const e = E;
+    E = null;
+    if (!e) return;
+    e.playing = false; cancelAnimationFrame(e.raf); clearTimeout(e.poll); e.ro?.disconnect();
+    for (const v of $$('[data-ed-frame] video, [data-ed-auds] audio')) v.pause();
+    edPreview.pause();
+    if (e.rev !== e.savedRev) edSave(e);
+  },
+  regions: {},
+};
+
+async function edLoad() {
+  const e = E;
+  if (!e) return;
+  clearTimeout(e.poll);
+  let d;
+  try { d = await api(`/api/projects/${enc(e.slug)}/editor`); } catch (err) { d = { ready: false, error: err.message }; }
+  if (E !== e) return;
+  // A video made a moment ago is not in the state yet when the page first draws.
+  const h1 = $('.ed-top h1');
+  if (h1 && proj(e.slug)) h1.textContent = proj(e.slug).title;
+  // Nothing opened and nothing on its way: polling would wait forever.
+  if (!d.ready && !d.preparing && !d.error) d.error = 'Nothing is open in the editor for this video yet. Go back, pick a version, and press "Open in editor".';
+  Object.assign(e, { canAuto: d.canAuto, from: d.from, W: d.width || e.W, H: d.height || e.H, preparing: d.preparing || '' });
+  if (!d.ready) {
+    $('[data-ed-body]').innerHTML = d.error && !d.preparing
+      ? `<div class="ed-wait">${I.warn}<b>The editor could not open this video.</b><span>${esc(d.error)}</span><a class="btn" href="#/p/${enc(e.slug)}">Back to the video</a></div>`
+      : `<div class="ed-wait"><span class="live"></span><b>${d.fixing ? 'Fixing one part…' : 'Getting your clips ready…'}</b><span>${esc(d.preparing || 'Long clips take a minute or two.')} You can leave this page and come back.</span></div>`;
+    e.poll = setTimeout(edLoad, d.error && !d.preparing ? 8000 : 2000);
+    return;
+  }
+  e.sources = d.sources;
+  e.sounds = d.sounds || [];
+  if (!e.ready) {
+    e.ready = true;
+    e.parts = d.parts?.length ? d.parts : d.sources.filter((s) => s.kind !== 'sound').map((s) => ({ src: s.id, in: 0, out: s.duration, zoom: 1, x: 0.5, y: 0.5, volume: 1 }));
+    e.marks = d.marks || [];
+    e.audio = d.audio || [];
+    e.last = edJSON();
+    edBuild();
+  } else edSyncVideos();
+  // A clip or sound added from "Add clip" / "Add sound" goes in at the playhead once its source is ready to play.
+  const s = e.pending && d.sources.find((x) => x.id === e.pending.id);
+  if (s?.url && s.duration > 0 && !d.preparing) {
+    edPause();
+    const sound = e.pending.kind === 'sound';
+    if (sound) {
+      e.audio.push({ id: nextSoundId(e.audio), src: s.id, in: 0, out: r3(s.duration), at: r3(e.pending.t), volume: 1 });
+      Object.assign(e, { pending: null, sel: -1, mark: -1, snd: e.audio.length - 1, panel: null });
+    } else {
+      const i = insertAt(e.parts, e.pending.t, { src: s.id, in: 0, out: r3(s.duration), zoom: 1, x: 0.5, y: 0.5, volume: 1 });
+      Object.assign(e, { pending: null, sel: i, mark: -1, snd: -1, panel: null, t: partStart(e.parts, i) });
+    }
+    edCommit(); edDraw(); toast(sound ? 'Sound added.' : 'Clip added.');
+  } else if (e.pending && d.error) { e.pending = null; toast(d.error, { bad: true, ms: 9000 }); }
+  edDrawTools();
+  if (d.preparing || e.pending) e.poll = setTimeout(edLoad, 2000);
+}
+
+function edBuild() {
+  $('[data-ed-body]').innerHTML = `
+    <div class="ed-stage" data-ed-stage>
+      <div class="ed-frame" data-ed-frame role="group" aria-label="Video preview. Drag to move the picture, scroll to zoom.">
+        <div class="ed-boxes" data-ed-boxes></div><div class="ed-draw" data-ed-draw hidden></div>
+        <p class="ed-hint" data-ed-hint hidden>Draw a box around the spot</p>
+      </div>
+    </div>
+    <div data-ed-auds hidden></div>
+    <div class="ed-tools" data-ed-tools></div>
+    <div class="ed-scroll" data-ed-scroll><div class="ed-track" data-ed-track></div></div>`;
+  edSyncVideos();
+  const stage = $('[data-ed-stage]');
+  const fit = () => {
+    const f = $('[data-ed-frame]');
+    if (!f || !E?.W) return;
+    const k = Math.min((stage.clientWidth - 32) / E.W, (stage.clientHeight - 32) / E.H); // minus the stage padding
+    f.style.width = `${E.W * k}px`; f.style.height = `${E.H * k}px`;
+  };
+  E.ro = new ResizeObserver(fit);
+  E.ro.observe(stage);
+  fit();
+  E.pps = Math.min(300, Math.max(2, ($('[data-ed-scroll]').clientWidth - 80) / Math.max(1, edTotal())));
+  edDraw();
+}
+
+// Adds a <video> (and reads the filmstrip size) for each source that does not have one yet.
+function edSyncVideos() {
+  const f = $('[data-ed-frame]');
+  if (!f) return;
+  for (const s of E.sources) {
+    if (!s.url || s.kind === 'sound' || edVid(s.id)) continue;
+    const v = document.createElement('video');
+    Object.assign(v, { src: s.url, preload: 'auto', playsInline: true, hidden: true });
+    v.dataset.src = s.id;
+    f.prepend(v);
+    if (s.strip && !(s.id in E.frames)) {
+      E.frames[s.id] = s.duration;
+      const im = new Image();
+      // The filmstrip is one frame per second in a row; count its frames so the timeline lines up.
+      im.onload = () => { if (E) { E.frames[s.id] = Math.round(im.naturalWidth / ((im.naturalHeight * s.width) / s.height)) || s.duration; edDrawTrack(); } };
+      im.src = s.strip;
+    }
+  }
+}
+
+function edPlace(v, p) {
+  const s = v && edSrc(p.src);
+  if (!s) return;
+  const g = place(p, s, E.W, E.H);
+  Object.assign(v.style, { width: `${g.w * 100}%`, height: `${g.h * 100}%`, left: `${g.left * 100}%`, top: `${g.top * 100}%` });
+}
+
+// Shows output time t in the player (seeking that source when paused).
+function edShow(t, seek = !E.playing) {
+  const L = locate(E.parts, Math.max(0, t));
+  if (!L) return;
+  E.t = L.start + L.off;
+  const p = E.parts[L.i];
+  E.cur = L.i;
+  for (const v of $$('[data-ed-frame] video')) { const on = v.dataset.src === p.src; if (!on) v.pause(); v.hidden = !on; }
+  const v = edVid(p.src);
+  edPlace(v, p);
+  if (v) edGain(v, p.volume ?? 1);
+  if (v && seek) v.currentTime = Math.min(p.in + L.off, p.out - 0.01);
+  edTick();
+}
+
+function edTick() {
+  const head = $('[data-ed-head]');
+  if (head) head.style.transform = `translateX(${E.t * E.pps}px)`;
+  const tm = $('[data-ed-time]');
+  if (tm) tm.textContent = `${fmtClock(E.t)} / ${fmtClock(edTotal())}`;
+  const on = E.marks.map((m, i) => [m, i]).filter(([m]) => E.t >= m.start && E.t < m.end);
+  const html = on.map(([m, i]) => `<div class="ed-box${i === E.mark ? ' on' : ''}" style="left:${m.box.x * 100}%;top:${m.box.y * 100}%;width:${m.box.w * 100}%;height:${m.box.h * 100}%"><span>${i + 1}</span></div>`).join('');
+  const boxes = $('[data-ed-boxes]');
+  if (boxes && boxes.innerHTML !== html) boxes.innerHTML = html;
+}
+
+function edFollow() {
+  const sc = $('[data-ed-scroll]');
+  const x = E.t * E.pps;
+  if (sc && (x < sc.scrollLeft || x > sc.scrollLeft + sc.clientWidth - 40)) sc.scrollLeft = x - 40;
+}
+
+function edPlay() {
+  if (E.playing) return edPause();
+  if (E.t >= edTotal() - 0.05) E.t = 0;
+  edShow(E.t, true);
+  E.playing = true;
+  E.ac?.resume();
+  edVid(E.parts[E.cur].src)?.play().catch(() => edPause());
+  edSyncAudio();
+  edDrawPlay();
+  const step = () => {
+    if (!E?.playing) return;
+    const p = E.parts[E.cur];
+    const v = edVid(p.src);
+    if (v && !v.seeking) {
+      if (v.currentTime >= p.out - 0.03 || v.ended) {
+        if (E.cur + 1 >= E.parts.length) { E.t = edTotal(); edPause(); edTick(); return; }
+        edShow(partStart(E.parts, E.cur + 1), true);
+        edVid(E.parts[E.cur].src)?.play().catch(() => {});
+      } else E.t = partStart(E.parts, E.cur) + Math.max(0, v.currentTime - p.in);
+      edTick(); edFollow(); edSyncAudio();
+    }
+    E.raf = requestAnimationFrame(step);
+  };
+  E.raf = requestAnimationFrame(step);
+}
+function edPause() {
+  if (!E) return;
+  E.playing = false;
+  cancelAnimationFrame(E.raf);
+  for (const v of $$('[data-ed-frame] video')) v.pause();
+  edSyncAudio();
+  edDrawPlay();
+}
+// Volume 0-5 on a <video> or <audio>. Over 100% needs Web Audio (an element can only be routed once, so it stays routed).
+function edGain(el, vol) {
+  if (vol <= 1 && !el.gain) { el.volume = vol; return; }
+  try {
+    E.ac ||= new AudioContext();
+    if (!el.gain) { el.gain = E.ac.createGain(); E.ac.createMediaElementSource(el).connect(el.gain).connect(E.ac.destination); }
+    el.volume = 1; el.gain.gain.value = vol;
+  } catch { el.volume = Math.min(1, vol); }
+}
+// Sound clips: one <audio> each, playing only while the playhead is inside it, kept in step with the playhead.
+function edSyncAudio() {
+  const box = $('[data-ed-auds]');
+  if (!box) return;
+  for (const el of $$('audio', box)) if (!E.audio.some((a) => a.id === el.dataset.id && edSrc(a.src)?.url === el.dataset.url)) { el.pause(); el.remove(); }
+  for (const a of E.audio) {
+    let el = $$('audio', box).find((x) => x.dataset.id === a.id);
+    const off = E.t - a.at;
+    const on = E.playing && off >= 0 && off < sndLen(a);
+    if (!on) { el?.pause(); continue; }
+    const url = edSrc(a.src)?.url;
+    if (!url) continue;
+    if (!el) { el = document.createElement('audio'); Object.assign(el, { preload: 'auto', src: url }); Object.assign(el.dataset, { id: a.id, url }); box.append(el); }
+    edGain(el, a.volume ?? 1);
+    if (!el.seeking && (el.paused || Math.abs(el.currentTime - (a.in + off)) > 0.4)) el.currentTime = a.in + off;
+    if (el.paused) el.play().catch(() => {});
+  }
+}
+function edDrawPlay() {
+  const b = $('[data-action="ed-play"]');
+  if (!b) return;
+  b.innerHTML = E.playing ? EI.pause : I.play;
+  b.setAttribute('aria-label', E.playing ? 'Pause (Space)' : 'Play (Space)');
+}
+
+// After any change: keep marks inside the video, keep an undo step, save soon. merge: a slider, drag or typing, whose
+// quick repeats are one undo step; buttons and keys are always their own step, however fast they come.
+function edCommit(merge = false) {
+  const total = edTotal();
+  for (const m of E.marks) { m.end = r3(Math.min(m.end, total)); m.start = r3(Math.max(0, Math.min(m.start, m.end - MIN_PART))); }
+  const now = edJSON();
+  if (now === E.last) return;
+  if (!merge || !E.snapMerge || Date.now() - E.snapAt > 700) { E.undo.push(E.last); if (E.undo.length > 100) E.undo.shift(); }
+  E.snapAt = Date.now(); E.snapMerge = merge; E.last = now; E.rev++;
+  clearTimeout(E.timer);
+  E.timer = setTimeout(() => edSave(E), 800);
+  edStatus();
+}
+// Saves are chained so an older save never lands after a newer one.
+function edSave(e) {
+  if (!e) return Promise.resolve();
+  clearTimeout(e.timer);
+  e.saveP = e.saveP.then(async () => {
+    if (e.savedRev === e.rev) return;
+    const rev = e.rev;
+    try {
+      await api(`/api/projects/${enc(e.slug)}/editor`, { method: 'PUT', body: { parts: e.parts, marks: e.marks, audio: e.audio } });
+      e.savedRev = rev; e.saveErr = '';
+    } catch (err) { e.saveErr = err.message; e.timer = setTimeout(() => edSave(e), 5000); }
+  });
+  if (E === e) edStatus();
+  return e.saveP.then(() => { if (E === e) edStatus(); });
+}
+addEventListener('beforeunload', (ev) => { if (E && E.rev !== E.savedRev) { edSave(E); ev.preventDefault(); ev.returnValue = ''; } });
+
+function edStatus() {
+  const el = $('[data-ed-status]');
+  if (!el || !E) return;
+  el.classList.toggle('bad', Boolean(E.saveErr) && !E.busy);
+  el.innerHTML = E.busy ? `<span class="live"></span> ${esc(E.busy)}`
+    : E.saveErr ? `Not saved: ${esc(E.saveErr)} Trying again…`
+    : E.rev !== E.savedRev ? 'Saving…' : E.rev ? 'All changes saved' : '';
+  for (const b of $$('[data-action="ed-render"], [data-action="ed-auto"]')) b.disabled = !E.ready || Boolean(E.busy) || Boolean(E.pending);
+}
+
+function edDraw() { edDrawTrack(); edDrawTools(); edShow(E.t); edStatus(); }
+
+// Re-renders keep keyboard focus on the same control.
+function keepFocus(box, render) {
+  const a = document.activeElement;
+  const sel = box.contains(a) ? ['action', 'dir', 'panel', 'ed', 'edPart', 'edMark', 'edSnd'].filter((k) => a.dataset[k] != null)
+    .map((k) => `[data-${k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`)}="${CSS.escape(a.dataset[k])}"]`).join('') : '';
+  render();
+  if (sel) $(sel, box)?.focus({ preventScroll: true });
+}
+
+// The strip under the player: play and time, the tools for what is selected (square buttons), timeline zoom.
+// Zoom, Volume and Note swap the tools for one slider (or text) row with a Done button.
+function edDrawTools() {
+  const el = $('[data-ed-tools]');
+  if (!el) return;
+  const z = Math.round((Math.log(E.pps / 2) / Math.log(150)) * 100);
+  const p = E.parts[E.sel], a = E.audio[E.snd], m = E.marks[E.mark];
+  const target = a || p; // what Volume and Mute change
+  const vol = target?.volume ?? 1;
+  const tile = (action, ic, label, on = true, more = '') => `<button type="button" class="ed-tile" data-action="${action}" ${more}${on ? '' : ' disabled'}>${ic}<span>${label}</span></button>`;
+  const done = `<button class="btn sm primary" data-action="ed-panel">${I.check} Done</button>`;
+  let mid;
+  if (E.panel === 'zoom' && p) {
+    mid = `<div class="ed-slide"><span class="ed-slide-name">${EI.zoom} Zoom</span>
+      <input type="range" data-ed="zoom" min="0.5" max="3" step="0.01" value="${p.zoom}" aria-label="Zoom">
+      <b class="num" data-ed-val>${pct(p.zoom)}</b><span class="small muted ed-slide-hint">Drag the picture to move it.</span>
+      <button class="btn sm" data-action="ed-reset">${EI.reset} Reset</button>${done}</div>`;
+  } else if (E.panel === 'volume' && target) {
+    mid = `<div class="ed-slide"><span class="ed-slide-name">${EI.vol} Volume</span>
+      <input type="range" data-ed="volume" min="0" max="5" step="0.01" value="${vol}" aria-label="Volume">
+      <b class="num" data-ed-val>${pct(vol)}</b><span class="small muted ed-slide-hint">100% is as recorded.</span>${done}</div>`;
+  } else if (E.panel === 'note' && m) {
+    mid = `<div class="ed-slide"><label class="ed-slide-name" for="ed-note">${EI.note} Note</label>
+      <input type="text" id="ed-note" data-ed="note" maxlength="300" value="${esc(m.note)}" placeholder="What should the AI fix here? e.g. Glitch on the wall, cover it.">${done}</div>`;
+  } else {
+    const split = tile('ed-split', EI.split, 'Split', true, 'title="Split at the playhead (S)"');
+    const del = tile('ed-delete', I.trash, 'Delete', true, 'title="Delete (Delete key)"');
+    const volume = tile('ed-panel', EI.vol, 'Volume', true, 'data-panel="volume"');
+    const mute = tile('ed-mute', vol ? I.soundOff : I.soundOn, vol ? 'Mute' : 'Unmute');
+    const tiles = a ? [split, del, volume, mute]
+      : p ? [split, del, tile('ed-panel', EI.zoom, 'Zoom', true, 'data-panel="zoom"'), tile('ed-reset', EI.reset, 'Reset position'), volume, mute,
+        tile('ed-extract', EI.wave, 'Extract audio', Boolean(edSrc(p.src)?.wave), 'title="Make this part\'s sound its own clip, and mute the part"'),
+        tile('ed-move', I.left, 'Move earlier', E.sel > 0, 'data-dir="-1"'), tile('ed-move', I.right, 'Move later', E.sel < E.parts.length - 1, 'data-dir="1"')]
+      : m ? [tile('ed-panel', EI.note, 'Note', true, 'data-panel="note"'),
+        tile('ed-fix', I.star, 'Fix with AI', !E.busy, 'title="The AI fixes only this part, the way the note says, then puts it back and saves a new version"'), del]
+      : [tile('ed-add', I.film, 'Add clip', !E.pending), tile('ed-add-sound', EI.addSound, 'Add sound', !E.pending),
+        tile('ed-mark', EI.mark, 'Mark a spot', true, `aria-pressed="${E.marking}" title="Draw a box on the video for the AI to fix"`), split];
+    const what = a ? `Sound ${E.snd + 1}` : p ? `Part ${E.sel + 1}` : m ? `Mark ${E.mark + 1}` : '';
+    mid = `<div class="ed-grid" role="group" aria-label="${what ? `Tools for ${what.toLowerCase()}` : 'Tools'}">
+      ${what ? tile('ed-unselect', I.check, 'Done', true, `title="Done with ${what.toLowerCase()} (Esc)"`) : ''}${tiles.join('')}
+      ${tile('ed-undo', EI.undo, 'Undo', E.undo.length > 0, 'title="Undo (Ctrl or Cmd + Z)"')}</div>`;
+  }
+  keepFocus(el, () => {
+    el.innerHTML = `<div class="ed-transport"><button class="btn sm icon ed-play" data-action="ed-play"></button><span class="num small ed-time" data-ed-time></span></div>
+      ${mid}
+      <div class="ed-right">${E.pending || E.preparing ? `<span class="small ed-prep"><span class="live"></span> ${esc(E.preparing || 'Getting it ready…')}</span>` : ''}
+        <label class="ed-tlzoom small">Timeline<input type="range" data-ed="tlzoom" min="0" max="100" step="1" value="${z}" aria-label="Zoom the timeline"></label></div>`;
+  });
+  edDrawPlay(); edTick();
+}
+
+function edDrawTrack() {
+  const tr = $('[data-ed-track]');
+  if (!tr) return;
+  const pps = E.pps, total = edTotal();
+  const step = [0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300].find((s) => s * pps >= 64) || 600;
+  let ruler = '';
+  for (let s = 0; s <= total + step; s += step) ruler += `<span style="left:${s * pps}px">${step < 1 ? fmtClock(s) : fmtDur(s) || '0:00'}</span>`;
+  let x = 0;
+  const parts = E.parts.map((p, i) => {
+    const s = edSrc(p.src) || {};
+    const w = partLen(p) * pps;
+    const bg = s.strip ? `background-image:url(${esc(JSON.stringify(s.strip))});background-size:${(E.frames[p.src] || s.duration) * pps}px 100%;background-position:${-p.in * pps}px 0;` : '';
+    const html = `<button type="button" class="ed-part" data-ed-part="${i}" aria-pressed="${i === E.sel}" style="left:${x}px;width:${w}px;${bg}"
+      aria-label="Part ${i + 1} of ${E.parts.length}: ${esc(s.label || 'clip')}, ${partLen(p).toFixed(1)} seconds${p.zoom !== 1 ? `, zoom ${Math.round(p.zoom * 100)}%` : ''}">
+      ${s.wave ? `<span class="ed-pwave" style="${edWave(s, p.in)}"></span>` : ''}
+      <span class="ed-lbl">${(p.volume ?? 1) === 0 ? I.soundOff : ''}${esc(s.label || '')} <b class="num">${partLen(p).toFixed(1)}s</b>${(p.volume ?? 1) !== 1 ? ` <b class="num">${pct(p.volume)}</b>` : ''}</span><span class="ed-trim l" data-trim="in"></span><span class="ed-trim r" data-trim="out"></span></button>`;
+    x += w;
+    return html;
+  }).join('');
+  const rows = soundRows(E.audio);
+  const sounds = E.audio.map((a, i) => {
+    const s = edSrc(a.src) || {};
+    return `<button type="button" class="ed-snd" data-ed-snd="${i}" aria-pressed="${i === E.snd}" style="left:${a.at * pps}px;width:${sndLen(a) * pps}px;top:${rows[i] * 38}px;${s.wave ? edWave(s, a.in) : ''}"
+      aria-label="Sound ${i + 1}: ${esc(s.label || 'sound')}, from ${fmtClock(a.at)}, ${sndLen(a).toFixed(1)} seconds, volume ${pct(a.volume)}">
+      <span class="ed-lbl">${a.volume === 0 ? I.soundOff : ''}${esc(s.label || '')}${(a.volume ?? 1) !== 1 ? ` <b class="num">${pct(a.volume)}</b>` : ''}</span><span class="ed-trim l" data-trim="in"></span><span class="ed-trim r" data-trim="out"></span></button>`;
+  }).join('');
+  const end = Math.max(total, ...E.audio.map((a) => a.at + sndLen(a)));
+  const marks = E.marks.map((m, i) => `<button type="button" class="ed-mark" data-ed-mark="${i}" aria-pressed="${i === E.mark}" style="left:${m.start * pps}px;width:${(m.end - m.start) * pps}px"
+    aria-label="Mark ${i + 1}, ${fmtClock(m.start)} to ${fmtClock(m.end)}: ${esc(m.note || 'no note yet')}"><span class="ed-lbl">${i + 1}. ${esc(m.note || 'Add a note')}</span><span class="ed-trim l" data-trim="start"></span><span class="ed-trim r" data-trim="end"></span></button>`).join('');
+  keepFocus(tr, () => {
+    tr.style.width = `${end * pps + 240}px`;
+    tr.innerHTML = `<div class="ed-ruler" data-ed-seek aria-hidden="true">${ruler}</div>
+      <div class="ed-lane ed-marks" data-ed-seek>${marks || '<span class="ed-empty">Marks for the AI show here. Use Mark a spot.</span>'}</div>
+      <div class="ed-lane ed-parts" data-ed-seek>${parts}</div>
+      <div class="ed-lane ed-sounds" data-ed-seek style="height:${(Math.max(0, ...rows) + 1) * 38}px">${sounds || '<span class="ed-empty">Sounds show here. Use Add sound, or Extract audio on a part.</span>'}</div>
+      <div class="ed-drop" data-ed-drop hidden></div><div class="ed-head" data-ed-head aria-hidden="true"><i></i></div>`;
+  });
+  edTick();
+}
+
+// The waveform of a source drawn so its time lines up with the timeline, starting at second `from` of the source.
+const edWave = (s, from) => `background-image:url(${esc(JSON.stringify(s.wave))});background-size:${s.duration * E.pps}px 100%;background-position:${-from * E.pps}px 0;`;
+
+// Selects a part, mark or sound clip ('part' | 'mark' | 'snd', or null for nothing) without re-rendering the block under the pointer.
+function edSelect(kind, i) {
+  Object.assign(E, { sel: kind === 'part' ? i : -1, mark: kind === 'mark' ? i : -1, snd: kind === 'snd' ? i : -1, panel: null });
+  for (const b of $$('[data-ed-part], [data-ed-mark], [data-ed-snd]')) {
+    const [n, cur] = 'edPart' in b.dataset ? [b.dataset.edPart, E.sel] : 'edMark' in b.dataset ? [b.dataset.edMark, E.mark] : [b.dataset.edSnd, E.snd];
+    b.setAttribute('aria-pressed', String(Number(n) === cur));
+  }
+  edDrawTools();
+}
+const edBlock = (b) => ('edMark' in b.dataset ? ['mark', Number(b.dataset.edMark)] : 'edSnd' in b.dataset ? ['snd', Number(b.dataset.edSnd)] : ['part', Number(b.dataset.edPart)]);
+
+// Zoom for part i (the selected one, else the one on screen); it is selected and shown.
+function edZoom(z, i = E.sel >= 0 ? E.sel : E.cur) {
+  const p = E.parts[i];
+  if (!p) return;
+  if (E.sel !== i) edSelect('part', i);
+  if (E.cur !== i) edShow(partStart(E.parts, i));
+  p.zoom = Math.round(Math.min(3, Math.max(0.5, z)) * 100) / 100;
+  const g = place(p, edSrc(p.src), E.W, E.H);
+  p.x = r3(g.x); p.y = r3(g.y); // store what is shown, so the saved video matches
+  edPlace(edVid(p.src), p);
+  const r = $('[data-ed="zoom"]');
+  if (r && document.activeElement !== r) r.value = p.zoom;
+  if (E.panel === 'zoom') $('[data-ed-val]').textContent = pct(p.zoom);
+  edCommit(true);
+}
+// Volume of the selected sound clip or part, 0-5.
+function edVolume(v) {
+  const t = E.audio[E.snd] || E.parts[E.sel];
+  if (!t) return;
+  t.volume = Math.round(Math.min(5, Math.max(0, v)) * 100) / 100;
+  const val = $('[data-ed-val]');
+  if (val) val.textContent = pct(t.volume);
+  const p = E.parts[E.cur], vid = p && edVid(p.src);
+  if (vid) edGain(vid, p.volume ?? 1);
+  edSyncAudio(); edCommit(true); edDrawTrack();
+}
+
+function edAddMark(box) {
+  if (E.marks.length >= 50) return toast('You can add up to 50 marks.');
+  const total = edTotal();
+  const start = Math.max(0, Math.min(E.t, total - 2));
+  E.marks.push({ start: r3(start), end: r3(Math.min(total, start + 2)), box, note: '' });
+  E.marking = false;
+  edSelect('mark', E.marks.length - 1);
+  E.panel = 'note';
+  edMarking(false); edCommit(); edDraw();
+  $('[data-ed="note"]')?.focus();
+}
+function edMarking(on) {
+  E.marking = on;
+  if (on) edPause();
+  $('[data-ed-hint]').hidden = !on;
+  $('[data-ed-frame]').classList.toggle('marking', on);
+  edDrawTools();
+}
+
+// Pointer drags listen on the window, so re-rendering the dragged element mid-drag is fine.
+function edDrag(e, move, up) {
+  const x0 = e.clientX, y0 = e.clientY;
+  const mv = (ev) => move(ev.clientX - x0, ev.clientY - y0, ev);
+  const end = (ev) => {
+    removeEventListener('pointermove', mv); removeEventListener('pointerup', end); removeEventListener('pointercancel', end);
+    up?.(ev.type === 'pointercancel', ev);
+  };
+  addEventListener('pointermove', mv); addEventListener('pointerup', end); addEventListener('pointercancel', end);
+}
+
+document.addEventListener('pointerdown', (e) => {
+  if (!E?.ready || e.button > 0 || !e.target.closest) return;
+  const frame = e.target.closest('[data-ed-frame]');
+  const block = e.target.closest('[data-ed-part], [data-ed-mark], [data-ed-snd]');
+  const tr = $('[data-ed-track]');
+  const timeAt = (cx) => Math.max(0, Math.min(edTotal(), (cx - tr.getBoundingClientRect().left) / E.pps));
+  if (frame && E.marking) {
+    e.preventDefault();
+    const r = frame.getBoundingClientRect();
+    const at = (ev) => [Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)), Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height))];
+    const [x0, y0] = at(e);
+    const draw = $('[data-ed-draw]');
+    let box = null;
+    edDrag(e, (dx, dy, ev) => {
+      const [x1, y1] = at(ev);
+      box = { x: r3(Math.min(x0, x1)), y: r3(Math.min(y0, y1)), w: r3(Math.abs(x1 - x0)), h: r3(Math.abs(y1 - y0)) };
+      Object.assign(draw.style, { left: `${box.x * 100}%`, top: `${box.y * 100}%`, width: `${box.w * 100}%`, height: `${box.h * 100}%` });
+      draw.hidden = false;
+    }, (cancel) => {
+      draw.hidden = true;
+      if (!cancel && box && box.w > 0.02 && box.h > 0.02) edAddMark(box);
+    });
+  } else if (frame) {
+    const p = E.parts[E.cur];
+    if (!p) return;
+    e.preventDefault();
+    if (E.sel !== E.cur) edSelect('part', E.cur);
+    const r = frame.getBoundingClientRect();
+    const g0 = place(p, edSrc(p.src), E.W, E.H);
+    edDrag(e, (dx, dy) => {
+      const g = place({ ...p, x: g0.x - dx / (r.width * g0.w), y: g0.y - dy / (r.height * g0.h) }, edSrc(p.src), E.W, E.H);
+      p.x = Math.round(g.x * 1e4) / 1e4; p.y = Math.round(g.y * 1e4) / 1e4;
+      edPlace(edVid(p.src), p);
+      edCommit(true);
+    });
+  } else if (block) {
+    const [kind, i] = edBlock(block);
+    const trim = e.target.closest('[data-trim]')?.dataset.trim;
+    const orig = { ...{ mark: E.marks, snd: E.audio, part: E.parts }[kind][i] };
+    const clickT = timeAt(e.clientX);
+    let moved = false;
+    edPause();
+    edSelect(kind, i);
+    edDrag(e, (dx) => {
+      if (!moved && Math.abs(dx) < 4) return;
+      moved = true;
+      const d = dx / E.pps;
+      if (kind === 'mark') {
+        const m = E.marks[i], total = edTotal(), len = orig.end - orig.start;
+        if (trim === 'start') m.start = r3(Math.min(Math.max(0, orig.start + d), m.end - MIN_PART));
+        else if (trim === 'end') m.end = r3(Math.max(Math.min(total, orig.end + d), m.start + MIN_PART));
+        else { m.start = r3(Math.min(Math.max(0, orig.start + d), total - len)); m.end = r3(m.start + len); }
+        edCommit(true); edDrawTrack(); edShow(trim === 'end' ? m.end - 0.01 : m.start);
+      } else if (kind === 'snd') {
+        // Sound clips move freely along the time; they may overlap other sounds.
+        const a = E.audio[i];
+        if (trim) trimSound(a, trim, d, orig, edSrc(a.src).duration); else a.at = r3(Math.max(0, orig.at + d));
+        edCommit(true); edDrawTrack(); edShow(trim === 'out' ? a.at + sndLen(a) - 0.01 : a.at);
+      } else if (trim) {
+        const p = E.parts[i];
+        trimPart(p, trim, orig[trim] + d, edSrc(p.src).duration);
+        edCommit(true); edDrawTrack();
+        edShow(partStart(E.parts, i) + (trim === 'in' ? 0 : partLen(p) - 0.01));
+      } else {
+        // Reorder: the block floats with the pointer and a line shows where it lands.
+        $(`[data-ed-part="${i}"]`)?.classList.add('dragging');
+        $(`[data-ed-part="${i}"]`)?.style.setProperty('transform', `translateX(${dx}px)`);
+        const mid = partStart(E.parts, i) + partLen(orig) / 2 + d;
+        const others = E.parts.filter((_, j) => j !== i);
+        E.dropTo = others.filter((p, j) => partStart(others, j) + partLen(p) / 2 < mid).length;
+        const line = $('[data-ed-drop]');
+        line.hidden = false;
+        line.style.left = `${totalLen(others.slice(0, E.dropTo)) * E.pps}px`;
+      }
+    }, (cancel) => {
+      if (!moved) {
+        if (!cancel) edShow(kind === 'mark' ? E.marks[i].start : kind === 'snd' ? clickT : Math.min(Math.max(clickT, partStart(E.parts, i)), partStart(E.parts, i) + partLen(E.parts[i]) - 0.01));
+        return;
+      }
+      if (kind === 'part' && !trim && !cancel && E.dropTo !== i) { movePart(E.parts, i, E.dropTo); E.sel = E.dropTo; E.t = partStart(E.parts, E.sel); edCommit(); }
+      edDraw();
+    });
+  } else if (e.target.closest('[data-ed-seek]')) {
+    edPause();
+    if (E.sel >= 0 || E.mark >= 0 || E.snd >= 0) edSelect(null, -1);
+    edShow(timeAt(e.clientX));
+    edDrag(e, (dx, dy, ev) => { edShow(timeAt(ev.clientX)); });
+  }
+});
+
+document.addEventListener('wheel', (e) => {
+  if (!E?.ready || E.marking || !e.target.closest?.('[data-ed-frame]')) return;
+  e.preventDefault();
+  edZoom((E.parts[E.cur]?.zoom || 1) * Math.exp(-e.deltaY * 0.0015), E.cur);
+}, { passive: false });
+
+document.addEventListener('input', (e) => {
+  const k = E?.ready && e.target.dataset?.ed;
+  if (!k) return;
+  if (k === 'zoom') edZoom(Number(e.target.value));
+  if (k === 'volume') edVolume(Number(e.target.value));
+  if (k === 'note' && E.marks[E.mark]) { E.marks[E.mark].note = e.target.value.slice(0, 300); edCommit(true); edDrawTrack(); }
+  if (k === 'tlzoom') { E.pps = 2 * 150 ** (Number(e.target.value) / 100); edDrawTrack(); edFollow(); }
+});
+
+document.addEventListener('keydown', (e) => {
+  if (!E?.ready || $('dialog[open]')) return;
+  const k = e.key;
+  if (k === 'Escape' && E.panel) { e.preventDefault(); ACTIONS['ed-panel']({}); return; }
+  if (e.target.closest?.('input, textarea, select, [contenteditable]')) return;
+  if ((e.metaKey || e.ctrlKey) && k.toLowerCase() === 'z') { e.preventDefault(); ACTIONS['ed-undo'](); return; }
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const block = e.target.closest?.('[data-ed-part], [data-ed-mark], [data-ed-snd]');
+  if (k === 'Enter' && block) {
+    e.preventDefault();
+    const [kind, i] = edBlock(block);
+    edPause(); edSelect(kind, i);
+    edShow(kind === 'mark' ? E.marks[i].start : kind === 'snd' ? Math.min(E.audio[i].at, edTotal()) : partStart(E.parts, i));
+  } else if (k === ' ') { e.preventDefault(); edPlay(); }
+  else if (k === 's' || k === 'S') ACTIONS['ed-split']();
+  else if (k === 'Delete' || k === 'Backspace') { e.preventDefault(); ACTIONS['ed-delete'](); }
+  else if (k === 'ArrowLeft' || k === 'ArrowRight') {
+    e.preventDefault(); edPause();
+    edShow(Math.min(edTotal(), Math.max(0, E.t + (k === 'ArrowLeft' ? -1 : 1) * (e.shiftKey ? 1 : 1 / 30)))); edFollow();
+  } else if (k === 'Escape') { if (E.marking) edMarking(false); else edSelect(null, -1); }
+});
+
+// Renders the edit list to the next version. Returns its file name.
+async function edRenderNow() {
+  const e = E;
+  e.busy = 'Making your video… usually under a minute'; edStatus();
+  try {
+    await edSave(e);
+    if (e.saveErr) throw new Error(`Your changes could not be saved: ${e.saveErr}`);
+    const r = await api(`/api/projects/${enc(e.slug)}/editor/render`, { body: {} });
+    e.rendered = { file: r.file, rev: e.rev };
+    S.sel[e.slug] = r.file;
+    return r.file;
+  } finally { e.busy = ''; if (E === e) edStatus(); }
+}
+
+function edClipDialog() {
+  const vids = S.state.inbox.filter((f) => f.kind === 'video');
+  const m = $('#modal');
+  m.innerHTML = `<div class="inner">
+    <div class="top"><div><h2 id="modal-title">Add a clip</h2><p class="muted" style="margin-top:4px">It goes in at the playhead (<span class="num">${fmtClock(E.t)}</span>). Drag it on the timeline to move it after.</p></div>
+      <button class="btn quiet icon" type="button" data-action="close-modal" aria-label="Close">${I.x}</button></div>
+    ${vids.length ? `<div class="import-grid">${vids.map((f) => `<button type="button" class="import-clip" data-action="ed-add-inbox" data-path="${esc(f.path)}">
+      <span class="ic-thumb"><img src="${clipThumb(f)}" alt="" loading="lazy" decoding="async"></span>
+      <span class="nm" title="${esc(f.name)}">${esc(f.folder ? `${f.folder} / ${f.name}` : f.name)}</span>${f.duration ? `<span class="len">${fmtDur(f.duration)}</span>` : ''}</button>`).join('')}</div>`
+      : '<div class="empty">No clips in your inbox yet.</div>'}
+    <div class="row spread foot"><span class="muted small">Or pick a video on this computer.</span><button class="btn" type="button" data-action="ed-upload">${I.up} Upload a clip</button></div>
+  </div>`;
+  m.showModal();
+}
+function edSoundDialog() {
+  const row = (f) => `<li><button type="button" class="btn quiet sm icon" data-action="ed-sound-play" data-path="${esc(f.path)}" aria-pressed="false" aria-label="Listen to ${esc(f.name)}">${I.play}</button>
+    <span class="nm" title="${esc(f.name)}">${esc(f.name)}</span><span class="muted small num">${fmtDur(f.duration)}</span>
+    <button type="button" class="btn sm" data-action="ed-sound-pick" data-path="${esc(f.path)}">${I.plus} Add</button></li>`;
+  const group = (kind, title) => { const g = E.sounds.filter((f) => f.kind === kind); return g.length ? `<div><h3 class="sub">${title}</h3><ul class="ed-sound-list">${g.map(row).join('')}</ul></div>` : ''; };
+  const m = $('#modal');
+  m.innerHTML = `<div class="inner">
+    <div class="top"><div><h2 id="modal-title">Add a sound</h2><p class="muted" style="margin-top:4px">It goes under the video at the playhead (<span class="num">${fmtClock(E.t)}</span>). Drag it on the timeline to move it after.</p></div>
+      <button class="btn quiet icon" type="button" data-action="close-modal" aria-label="Close">${I.x}</button></div>
+    ${E.sounds.length ? group('music', 'Music') + group('sfx', 'Sound effects') : '<div class="empty">No music or sound effects yet. Add some in My brand, or upload one here.</div>'}
+    <div class="row spread foot"><span class="muted small">Or pick a sound file on this computer.</span><button class="btn" type="button" data-action="ed-sound-upload">${I.up} Upload a sound</button></div>
+  </div>`;
+  m.showModal();
+}
+$('#modal').addEventListener('close', () => edPreview.pause());
+// Opens the file picker for a video clip ('part') or a sound file ('sound').
+function edPick(kind) {
+  $('#modal').close();
+  E.pickKind = kind;
+  const p = $('#clip-picker');
+  p.accept = kind === 'sound' ? 'audio/*,.mp3,.wav,.m4a,.aac' : 'video/*,.mov,.mp4,.m4v';
+  p.click();
+}
+// While a clip or sound is being added, show the server's "getting ready" text and keep the Add buttons off.
+function edWaitClip(e, kind = 'part') { e.pending = { id: null, kind }; edDrawTools(); edStatus(); edLoad(); }
+function edAdded(e, r, at) {
+  const s = r.source || r;
+  if (!s?.id) { e.pending = null; return toast('It could not be added. Try again.', { bad: true }); }
+  e.pending = { ...e.pending, id: s.id, t: at };
+  if (E === e) { edDrawTools(); edStatus(); edLoad(); }
+}
+$('#clip-picker').addEventListener('change', async (ev) => {
+  const file = ev.target.files[0];
+  ev.target.value = '';
+  const e = E;
+  if (!file || !e) return;
+  const at = e.t;
+  edWaitClip(e, e.pickKind);
+  const r = await sendFile(`/api/projects/${enc(e.slug)}/editor/source?name=${enc(file.name)}`, file, 'Adding');
+  if (r.error) { e.pending = null; if (E === e) { edDrawTools(); edStatus(); } return toast(r.error, { bad: true, ms: 9000 }); }
+  edAdded(e, r, at);
+});
 
 const SKELETON = `<div class="skeleton" role="status" aria-label="Loading">${'<i></i>'.repeat(8)}</div>`;
 
@@ -1337,10 +2043,11 @@ function stripHtml() {
   }).join('');
 }
 
-function openEditDialog(files) {
+// auto = { slug, file }: the same options, for sending an editor version to the AI as a new video.
+function openEditDialog(files, auto = null) {
   files = files.filter((p) => S.state.inbox.some((f) => f.path === p && f.kind === 'video'));
-  if (!files.length) return;
-  S.dialog = { files: [...files], keep: false };
+  if (!files.length && !auto) return;
+  S.dialog = { files: [...files], keep: false, auto };
   const n = files.length;
   const others = S.state.inbox.filter((x) => x.kind === 'video' && !files.includes(x.path));
   const extras = S.state.inbox.filter((x) => x.kind !== 'video');
@@ -1363,10 +2070,11 @@ function openEditDialog(files) {
   const pack = S.state.brand.pack;
   const m = $('#modal');
   m.innerHTML = `<form class="inner" method="dialog" data-form="edit">
-    <div class="top"><div><h2 id="modal-title">${n > 1 ? `One video from ${n} clips` : 'Edit this clip'}</h2>
-      <p class="muted" style="margin-top:4px">${n > 1 ? 'The editor listens to every clip, puts them in story order, and drops the retakes.' : esc(files[0].split('/').pop())}</p></div>
+    <div class="top"><div><h2 id="modal-title">${auto ? 'Auto edit your changes' : n > 1 ? `One video from ${n} clips` : 'Edit this clip'}</h2>
+      <p class="muted" style="margin-top:4px">${auto ? `The AI edits ${esc(auto.file)} as a new video and keeps your zoom, cuts and marks.` : n > 1 ? 'The editor listens to every clip, puts them in story order, and drops the retakes.' : esc(files[0].split('/').pop())}</p></div>
       <button class="btn quiet icon" type="button" data-action="close-modal" aria-label="Close">${I.x}</button></div>
-    <ol class="clipstrip" data-strip>${stripHtml()}</ol>
+    ${auto ? '' : `<ol class="clipstrip" data-strip>${stripHtml()}</ol>
+      <label class="tick"><input type="checkbox" name="manual" data-action="edit-manual">Adjust it myself first (zoom, cuts, clips)<small>Opens the editor. The AI starts when you press Auto edit there.</small></label>`}
     ${n > 1 ? '<label class="tick"><input type="checkbox" data-action="keep-order"><span>Keep the order I picked</span><small>Only if the editor gets it wrong</small></label>' : ''}
     <fieldset class="q"><legend><h3>What kind of edit?</h3></legend><p>Pick clean raw when you only want the cuts, for example before replacing the background.</p>
       <div class="opts">
@@ -1412,7 +2120,7 @@ function openEditDialog(files) {
       ${extras.length ? `<div><p class="small muted" style="margin-bottom:8px">Pictures or text from your inbox to use:</p><div class="ticks">${extras.map((o) => `<label class="tick"><input type="checkbox" name="extra" value="${esc(o.path)}">${shown(o)}</label>`).join('')}</div></div>` : ''}
     </div></details>
     <div class="row spread foot"><span class="muted small">${busy() ? `The editor is busy with “${esc(S.job.title)}”. This starts right after.` : 'Takes about 10 to 30 minutes. You can close this page while it works.'}</span>
-      <button class="btn primary big" type="submit">${busy() ? `${I.queue} Add to the line` : `${I.play} Start editing`}</button></div>
+      <button class="btn primary big" type="submit" data-label="${esc(busy() ? `${I.queue} Add to the line` : `${I.play} Start editing`)}">${busy() ? `${I.queue} Add to the line` : `${I.play} Start editing`}</button></div>
   </form>`;
   m.showModal();
   $('input[name="name"]', m).focus();
@@ -1599,16 +2307,6 @@ $('#style-picker').addEventListener('change', async (e) => {
   toast(r.queued ? 'Saved. The editor studies it when it is free.' : 'The editor is studying your video…');
   location.hash = `#/style/${enc(r.id)}`;
 });
-$('#clip-picker').addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  const c = S.clipAt;
-  e.target.value = '';
-  if (!file || !c) return;
-  S.clipAt = null;
-  const r = await sendFile(`/api/projects/${c.slug}/insert?from=${enc(c.file)}&at=${c.at}&name=${enc(file.name)}`, file, `Putting in at ${fmtClock(c.at)}:`);
-  if (r.error) return toast(r.error, { bad: true, ms: 9000 });
-  S.sel[c.slug] = r.file; refresh(); toast('Done. This is the new version.');
-});
 $('#bg-picker').addEventListener('change', async (e) => {
   const file = e.target.files[0], slug = S.bgSlug;
   e.target.value = '';
@@ -1656,12 +2354,13 @@ const ACTIONS = {
   },
   'bg-photo': (d) => { S.bgSlug = d.slug; $('#bg-picker').click(); },
   'bg-check': async (d) => { try { queuedToast(await api(`/api/projects/${d.slug}/bg/check`, { body: {} })); } catch (e) { fail(e); } },
+  'bg-copy-prompt': () => navigator.clipboard.writeText($('#bg-plate-prompt').value).then(() => toast('Prompt copied.'), fail),
   'bg-prices': (d) => api(`/api/projects/${d.slug}/bg/prices`, { body: {} }).catch(fail),
   'bg-plate': async (d, el) => {
     el.disabled = true;
     try {
       const { credits } = await api(`/api/projects/${d.slug}/bg/plate-price`, { body: {} });
-      if (await ask({ title: `Spend ${credits} credits?`, body: 'Makes an empty-room version of your photo, seen from your video\'s camera angle (Nano Banana 2.1, 2k). Then check it again before generating.', ok: `Spend ${credits} credits` })) {
+      if (await ask({ title: `Spend ${credits} credits?`, body: 'Makes an empty-room version of your photo, seen from your video\'s camera angle (Nano Banana Pro, 2k). Then check it again before generating.', ok: `Spend ${credits} credits` })) {
         await api(`/api/projects/${d.slug}/bg/plate`, { body: {} });
       }
     } catch (e) { fail(e); }
@@ -1683,6 +2382,7 @@ const ACTIONS = {
     if (!ok) return;
     try { await api(`/api/projects/${d.slug}/bg/again`, { body: { key: d.key, chunk: d.chunk || null } }); } catch (e) { fail(e); }
   },
+  'edit-manual': (d, el) => { const b = $('button[type="submit"]', el.form); b.innerHTML = el.checked ? `${I.film} Open the editor` : b.dataset.label; },
   'edit-kind': (d, el) => { for (const f of $$('.full-only', el.form)) f.hidden = el.value === 'clean'; },
   'pick-new': () => { S.pick = videosIn('').filter((f) => !f.edited).map((f) => f.path); refresh(); },
   'pick-folder': (d) => { S.pick = videosIn(d.name).map((f) => f.path); refresh(); },
@@ -1751,42 +2451,166 @@ const ACTIONS = {
     t.value = `${t.value.trim() ? `${t.value.trimEnd()}\n` : ''}At ${fmtDur(v.currentTime) || '0:00'}: `;
     t.focus(); t.setSelectionRange(t.value.length, t.value.length);
   },
-  'cut-start': (d) => {
-    const v = $('.monitor video');
-    if (!v) return;
-    if (!v.duration) return toast('The video is still loading. Try again in a moment.');
-    v.pause();
-    const from = Math.min(v.currentTime, Math.max(0, v.duration - 1));
-    S.cut[d.slug] = { file: selected(proj(d.slug)).file, from, to: Math.min(v.duration, from + 1), dur: v.duration };
-    refresh();
-    $('[data-cut-handle="to"]')?.focus();
-  },
-  'cut-cancel': (d) => { delete S.cut[d.slug]; refresh(); },
-  'cut-preview': (d) => {
-    const v = $('.monitor video');
-    const c = S.cut[d.slug];
-    if (!v || !c) return;
-    c.preview = false;
-    v.currentTime = Math.max(0, c.from - 2);
-    v.play().then(() => { c.preview = true; }).catch(() => {});
-  },
-  'cut-end': async (d) => {
-    const c = S.cut[d.slug];
-    if (!c || c.busy) return;
-    $('.monitor video')?.pause();
-    if (selected(proj(d.slug))?.file !== c.file) { delete S.cut[d.slug]; refresh(); return toast('You switched versions. Start the cut again.'); }
-    c.busy = true; c.preview = false; refresh();
+  // A different version replaces the edit list, so ask first when there are changes from another version.
+  'open-editor': async (d, el) => {
+    el.disabled = true;
     try {
-      const r = await api(`/api/projects/${d.slug}/cut`, { body: { from: c.file, start: c.from, end: c.to } });
-      delete S.cut[d.slug]; S.sel[d.slug] = r.file; refresh(); toast('Done. This is the new version.');
-    } catch (e) { c.busy = false; refresh(); fail(e); }
+      const cur = await api(`/api/projects/${enc(d.slug)}/editor`).catch(() => null);
+      if (cur?.from !== d.file) {
+        if (cur?.parts?.length && !await ask({ title: 'Start over from this version?', body: 'The editor has your changes from another version. Opening this version replaces them.', ok: 'Start over' })) { el.disabled = false; return; }
+        await api(`/api/projects/${enc(d.slug)}/editor/open`, { body: { from: d.file } });
+      }
+      location.hash = `#/edit/${enc(d.slug)}`;
+    } catch (e) { fail(e); }
+    el.disabled = false;
   },
-  'add-clip': (d) => {
-    const v = $('.monitor video');
-    if (!v) return;
-    v.pause();
-    S.clipAt = { slug: d.slug, at: v.currentTime, file: selected(proj(d.slug)).file };
-    $('#clip-picker').click();
+  'ed-play': () => E?.ready && edPlay(),
+  'ed-split': () => {
+    if (!E?.ready) return;
+    edPause();
+    if (E.snd >= 0) {
+      const i = splitSound(E.audio, E.snd, E.t, nextSoundId(E.audio));
+      if (i < 0) return toast('Move the playhead inside the sound first, away from its ends.');
+      E.snd = i;
+    } else {
+      const i = splitAt(E.parts, E.t);
+      if (i < 0) return toast('Move the playhead inside a part first, away from its ends.');
+      Object.assign(E, { sel: i, mark: -1 });
+    }
+    E.panel = null;
+    edCommit(); edDraw();
+  },
+  'ed-delete': () => {
+    if (!E?.ready) return;
+    if (E.snd >= 0) E.audio.splice(E.snd, 1);
+    else if (E.mark >= 0) E.marks.splice(E.mark, 1);
+    else if (E.sel >= 0) {
+      if (E.parts.length < 2) return toast('The video needs at least one part.');
+      edPause(); E.parts.splice(E.sel, 1); E.t = Math.min(E.t, edTotal());
+    } else return;
+    Object.assign(E, { sel: -1, mark: -1, snd: -1, panel: null });
+    edCommit(); edDraw();
+  },
+  // Zoom, Volume and Note open their row; Done (or Esc) closes it and puts focus back on the button that opened it.
+  'ed-panel': (d) => {
+    const prev = E.panel;
+    E.panel = d.panel || null;
+    edDrawTools();
+    if (E.panel) $('[data-ed-tools] .ed-slide input')?.focus(); else $(`[data-panel="${prev}"]`)?.focus();
+  },
+  'ed-mute': () => {
+    const t = E.audio[E.snd] || E.parts[E.sel];
+    if (!t) return;
+    t.volume = (t.volume ?? 1) > 0 ? 0 : 1;
+    edCommit(); edDraw();
+  },
+  'ed-extract': () => {
+    const p = E.parts[E.sel];
+    if (!p) return;
+    if (!edSrc(p.src)?.wave) return toast('This part has no sound to take out.');
+    if (E.audio.length >= 50) return toast('You can have up to 50 sounds.');
+    edPause();
+    E.audio.push(extractAudio(E.parts, E.sel, nextSoundId(E.audio)));
+    edCommit();
+    edSelect('snd', E.audio.length - 1);
+    edDraw();
+    toast('The sound is now its own clip under the video, and the part is muted.');
+  },
+  'ed-add-sound': () => {
+    if (!E?.ready) return;
+    if (E.audio.length >= 50) return toast('You can have up to 50 sounds.');
+    edSoundDialog();
+  },
+  'ed-sound-play': (d, el) => {
+    const again = !edPreview.paused && edPreview.dataset.path === d.path;
+    edPreview.pause();
+    for (const b of $$('[data-action="ed-sound-play"]')) { b.innerHTML = I.play; b.setAttribute('aria-pressed', 'false'); }
+    if (again) return;
+    edPreview.src = `/media/sounds/${encPath(d.path)}`;
+    edPreview.dataset.path = d.path;
+    edPreview.onended = () => { el.innerHTML = I.play; el.setAttribute('aria-pressed', 'false'); };
+    edPreview.play().catch(fail);
+    el.innerHTML = EI.pause; el.setAttribute('aria-pressed', 'true');
+  },
+  'ed-sound-pick': async (d) => {
+    const e = E, at = e.t;
+    $('#modal').close();
+    edWaitClip(e, 'sound');
+    try { edAdded(e, await api(`/api/projects/${enc(e.slug)}/editor/source`, { body: { sound: d.path } }), at); } catch (err) { e.pending = null; if (E === e) { edDrawTools(); edStatus(); } fail(err); }
+  },
+  'ed-sound-upload': () => edPick('sound'),
+  'ed-move': (d) => {
+    const j = E.sel + Number(d.dir);
+    if (E.sel < 0 || j < 0 || j >= E.parts.length) return;
+    edPause(); movePart(E.parts, E.sel, j);
+    Object.assign(E, { sel: j, t: partStart(E.parts, j) });
+    edCommit(); edDraw();
+  },
+  'ed-add': () => E?.ready && edClipDialog(),
+  'ed-add-inbox': async (d) => {
+    const e = E, at = e.t;
+    $('#modal').close();
+    edWaitClip(e);
+    try { edAdded(e, await api(`/api/projects/${enc(e.slug)}/editor/source`, { body: { inbox: d.path } }), at); } catch (err) { e.pending = null; if (E === e) { edDrawTools(); edStatus(); } fail(err); }
+  },
+  'ed-upload': () => edPick('part'),
+  'ed-mark': () => edMarking(!E.marking),
+  'ed-unselect': () => edSelect(null, -1),
+  'ed-reset': () => {
+    const i = E.sel >= 0 ? E.sel : E.cur, p = E.parts[i];
+    if (!p) return;
+    p.x = 0.5; p.y = 0.5; edZoom(1, i);
+    const r = $('[data-ed="zoom"]');
+    if (r) r.value = 1;
+  },
+  'ed-undo': () => {
+    if (!E?.ready || !E.undo.length) return;
+    edPause();
+    const s = E.undo.pop();
+    ({ parts: E.parts, marks: E.marks, audio: E.audio } = JSON.parse(s));
+    Object.assign(E, { last: s, rev: E.rev + 1, sel: -1, mark: -1, snd: -1, panel: null, snapAt: 0 });
+    clearTimeout(E.timer); E.timer = setTimeout(() => edSave(E), 800);
+    edDraw();
+  },
+  // Sends only the selected mark's stretch to the AI. The page waits (and reloads the edit) until the fixed part is back.
+  'ed-fix': async () => {
+    const e = E, i = e.mark, m = e.marks[i];
+    if (!m || e.busy) return;
+    edPause();
+    try { await edSave(e); if (e.saveErr) throw new Error(`Your changes could not be saved: ${e.saveErr}`); } catch (err) { return fail(err); }
+    // Locked from here: the wait screen replaces the editor, and edLoad brings it back from what the server has.
+    Object.assign(e, { ready: false, sel: -1, mark: -1, snd: -1, panel: null, marking: false, undo: [] });
+    const when = `${fmtClock(m.start)} to ${fmtClock(m.end)}`;
+    $('[data-ed-body]').innerHTML = `<div class="ed-wait"><span class="live"></span><b>Fixing one part…</b><span>Cutting out ${when}…</span></div>`;
+    try {
+      const r = await api(`/api/projects/${enc(e.slug)}/editor/fix`, { body: { mark: i } });
+      askNotify();
+      if (r.queued) queuedToast(r); else toast(`The AI is fixing ${when}. Only that part changes.`);
+    } catch (err) { fail(err); }
+    if (E === e) edLoad();
+  },
+  'ed-render': async () => {
+    const slug = E.slug;
+    try { await edRenderNow(); toast('Saved as a new version.', { link: { href: `#/p/${enc(slug)}`, label: 'Watch it' }, ms: 9000 }); } catch (err) { fail(err); }
+  },
+  // Auto edit sends the shown edit as a version: render it first unless nothing changed since the last render.
+  'ed-auto': async () => {
+    const e = E;
+    try {
+      // Opened from a version and left as it is: send that version, no copy.
+      const [p] = e.parts, src = e.sources.find((s) => s.id === p?.src);
+      const untouched = e.from && e.parts.length === 1 && !e.marks.length && src?.url.startsWith(`/media/outbox/${e.from}?`)
+        && p.in < 0.05 && p.out > src.duration - 0.05 && p.zoom === 1 && p.x === 0.5 && p.y === 0.5 && (p.volume ?? 1) === 1 && !e.audio.length;
+      const file = untouched ? e.from : e.rendered?.rev === e.rev ? e.rendered.file : await edRenderNow();
+      if (e.canAuto === 'form') return openEditDialog([], { slug: e.slug, file });
+      e.busy = 'Sending it to the AI editor…'; edStatus();
+      const r = await api(`/api/projects/${enc(e.slug)}/editor/auto`, { body: { file } });
+      askNotify();
+      if (r.queued) queuedToast(r); else toast('The AI editor is on it. You get a notice when it is ready.');
+      location.hash = `#/p/${enc(r.slug || e.slug)}`;
+    } catch (err) { fail(err); }
+    e.busy = '';
+    if (E === e) edStatus();
   },
   target: (d) => { S.noteTarget[d.slug] = d.t; refresh(); },
   'send-note': async (d, el) => {
@@ -2012,18 +2836,23 @@ document.addEventListener('submit', async (e) => {
       // A row counts as picked when ticked or when its "what's it for" note is filled in.
       const assets = $$('.asset-row', form).map((row) => ({ ref: $('input[name="asset"]', row).value, on: $('input[name="asset"]', row).checked, note: $('.asset-note', row).value.trim() }))
         .filter((a) => a.on || a.note).map(({ ref, note }) => ({ ref, note }));
-      const r = await api('/api/edit', { body: {
-        files: S.dialog.files, keepOrder: S.dialog.keep, name: fd.get('name') || '',
+      const options = {
+        name: fd.get('name') || '',
         instructions: fd.get('instructions') || '', broll: fd.getAll('broll'), extra: fd.getAll('extra'),
         contact: fd.get('contact') && fd.get('contact') !== 'all' ? { type: 'person', id: fd.get('contact') } : { type: 'all' },
         style: fd.get('style') || '', music: fd.get('music') || '', sfx: fd.get('sfx') === 'on', assets, preview: fd.get('preview') === 'on',
         clean: fd.get('kind') === 'clean',
-      } });
+      };
+      const { auto } = S.dialog;
+      const manual = !auto && fd.get('manual') === 'on';
+      const r = auto
+        ? await api(`/api/projects/${enc(auto.slug)}/editor/auto`, { body: { file: auto.file, options } })
+        : await api('/api/edit', { body: { ...options, files: S.dialog.files, keepOrder: S.dialog.keep, manual } });
       try { localStorage.setItem('f247.contact', fd.get('contact') || 'all'); localStorage.setItem('f247.style', fd.get('style') || ''); } catch {}
       $('#modal').close();
-      S.pick = [];
-      askNotify(); queuedToast(r);
-      location.hash = `#/p/${enc(r.slug)}`;
+      if (!auto) S.pick = [];
+      if (!manual) { askNotify(); queuedToast(r); }
+      location.hash = manual ? `#/edit/${enc(r.slug)}` : `#/p/${enc(r.slug || auto.slug)}`;
     } catch (err) { fail(err); btn.disabled = false; }
   }
 });

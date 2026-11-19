@@ -20,6 +20,7 @@ import { basename, delimiter, dirname, extname, join, relative, resolve } from '
 import { pipeline } from 'node:stream/promises';
 import { fileURLToPath } from 'node:url';
 import { createBgSwap } from './bgswap.mjs';
+import { clock, cleanEdit, describeMarks, describeParts, describeSounds, markStillArgs, renderArgs, sliceEdit, spliceParts } from './editor.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const pub = join(root, 'app', 'public');
@@ -53,7 +54,7 @@ const MIME = {
   '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
   '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp',
   '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
-  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.txt': 'text/plain; charset=utf-8',
+  '.mp3': 'audio/mpeg', '.wav': 'audio/wav', '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.txt': 'text/plain; charset=utf-8',
   '.ttf': 'font/ttf', '.otf': 'font/otf', '.woff': 'font/woff', '.woff2': 'font/woff2',
 };
 const PERMISSION_MODES = ['auto', 'bypassPermissions'];
@@ -810,79 +811,316 @@ function nextVersion(slug, horizontal = false) {
   return Math.max(0, ...nums) + 1;
 }
 
-// ---------- quick edits (ffmpeg on this computer, no AI) ----------
-// Cut a part out of a draft, or put a clip in between, saved as the next version. The AI never sees
-// these, so each one is remembered on the project and handed to it with the next note or final.
+// ---------- the hand editor (ffmpeg on this computer, no AI) ----------
+// Cut, zoom, reposition and add clips by hand, saved as the next version. The AI never sees these,
+// so each render is remembered on the project and handed to it with the next note or final.
+// The edit list lives in kit/video-projects/<slug>/editor/edit.json; source files are relative to the repo root.
 
-const clock = (t) => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, '0')}`;
-function ffmpeg(args) {
-  return new Promise((done) => {
-    const p = spawn('ffmpeg', ['-y', '-v', 'error', ...args]);
-    let err = '';
-    p.stderr.on('data', (d) => { err += d; });
-    p.on('error', () => done(false));
-    p.on('close', (code) => { if (code) console.error(err.slice(-800)); done(code === 0); });
-  });
-}
+const run = (cmd, args) => new Promise((done) => {
+  const p = spawn(cmd, args);
+  let err = '';
+  p.stderr.on('data', (d) => { err += d; });
+  p.on('error', () => done(false));
+  p.on('close', (code) => { if (code) console.error(err.slice(-800)); done(code === 0); });
+});
+const ffmpeg = (args) => run('ffmpeg', ['-y', '-v', 'error', ...args]);
 function streamsOf(full) {
-  const r = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,r_frame_rate,sample_rate', '-of', 'json', full], { encoding: 'utf8' });
+  const r = spawnSync('ffprobe', ['-v', 'error', '-show_entries', 'stream=codec_type,channels', '-of', 'json', full], { encoding: 'utf8' });
   try { return JSON.parse(r.stdout).streams || []; } catch { return []; }
 }
-const ENCODE = ['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', '192k', '-movflags', '+faststart', '-f', 'mp4'];
+let hardwareH264 = null;
+const hasHardwareH264 = () => (hardwareH264 ??= /\bh264_videotoolbox\b/.test(spawnSync('ffmpeg', ['-hide_banner', '-encoders'], { encoding: 'utf8' }).stdout || ''));
 
-async function quickEdit(slug, from, edit) {
-  const v = (versionsBySlug().get(slug) || []).find((x) => x.file === from);
-  if (!v) return { error: 'That version is not here anymore.' };
-  if (job?.slug === slug || queue.some((q) => q.slug === slug)) return { error: 'The editor is working on this video. Try again when it has finished.' };
-  const src = join(dirs.outbox, from);
-  const { duration: dur, width: W, height: H } = probe(src, v.mtime);
-  if (!dur || !W) return { error: 'Could not read that video.' };
-  const horizontal = v.label.startsWith('horizontal');
-  const out = `${slug}-${horizontal ? 'horizontal-' : ''}v${nextVersion(slug, horizontal)}.mp4`;
-  const tmp = join(dirs.outbox, `.quick-${randomUUID()}.mp4`);
-  let args, said, line;
-  if (edit.cut) {
-    const a = Math.max(0, Number(edit.cut[0]) || 0);
-    const b = Math.min(dur, Number(edit.cut[1]) || 0);
-    if (!(b - a >= 0.1)) return { error: 'Pick where the cut ends after where it starts.' };
-    if (dur - (b - a) < 0.5) return { error: 'That would cut the whole video.' };
-    const keep = `not(between(t,${a.toFixed(3)},${b.toFixed(3)}))`;
-    args = ['-i', src, '-vf', `select='${keep}',setpts=N/FRAME_RATE/TB`, '-af', `aselect='${keep}',asetpts=N/SR/TB`, ...ENCODE, tmp];
-    said = `Cut ${clock(a)} to ${clock(b)}.`;
-    line = `cut ${clock(a)}–${clock(b)} out of outbox/${from}, saved as outbox/${out}`;
-  } else {
-    const at = Math.min(dur, Math.max(0, Number(edit.at) || 0));
-    const clip = edit.clip;
-    const cm = probe(clip, statSafe(clip));
-    if (!cm.duration || !cm.width) return { error: 'That clip is not a video this computer can read.' };
-    const ss = streamsOf(src);
-    const fps = ss.find((s) => s.codec_type === 'video')?.r_frame_rate || '30';
-    const sr = ss.find((s) => s.codec_type === 'audio')?.sample_rate || '48000';
-    const vf = `fps=${fps},format=yuv420p,setsar=1,setpts=PTS-STARTPTS`;
-    const af = `aformat=sample_rates=${sr}:channel_layouts=stereo,asetpts=PTS-STARTPTS`;
-    // The clip fills the frame (cropped, not letterboxed), and plays whole with its own sound.
-    let g = `[1:v]scale=trunc(iw*sar/2)*2:ih,setsar=1,scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},${vf}[cv];`
-      + (streamsOf(clip).some((s) => s.codec_type === 'audio') ? `[1:a]${af}[ca];` : `anullsrc=r=${sr}:cl=stereo,atrim=0:${cm.duration.toFixed(3)},${af}[ca];`);
-    const order = [];
-    if (at > 0.05) { g += `[0:v]trim=0:${at.toFixed(3)},${vf}[v0];[0:a]atrim=0:${at.toFixed(3)},${af}[a0];`; order.push('[v0][a0]'); }
-    order.push('[cv][ca]');
-    if (at < dur - 0.05) { g += `[0:v]trim=${at.toFixed(3)},${vf}[v2];[0:a]atrim=${at.toFixed(3)},${af}[a2];`; order.push('[v2][a2]'); }
-    g += `${order.join('')}concat=n=${order.length}:v=1:a=1[v][a]`;
-    args = ['-i', src, '-i', clip, '-filter_complex', g, '-map', '[v]', '-map', '[a]', ...ENCODE, tmp];
-    const rel = relative(root, clip).split('\\').join('/');
-    said = `Put ${basename(clip)} in at ${clock(at)}.`;
-    line = `put ${rel} in at ${clock(at)} of outbox/${from} (the whole clip, with its own sound, then the video continues), saved as outbox/${out}`;
+const editorDir = (slug) => join(root, 'kit', 'video-projects', slug, 'editor');
+const editFile = (slug) => join(editorDir(slug), 'edit.json');
+const loadEdit = (slug) => readJson(editFile(slug), null);
+const saveEdit = (slug, e) => { mkdirSync(editorDir(slug), { recursive: true }); writeJson(editFile(slug), e); };
+const repoPath = (full) => relative(root, full).split('\\').join('/');
+// A source is an outbox version (used as it is), a prepared copy in editor/src/, an uploaded sound in
+// assets/added/, or a sound in my-sounds/. Nothing else.
+function sourceFull(slug, file) {
+  const f = String(file || '');
+  const m = f.match(/^outbox\/([^/]+)$/);
+  if (m) return safeName(m[1]) ? join(dirs.outbox, m[1]) : null;
+  if (f.startsWith('my-sounds/')) { const rel = safePath(f.slice(10)); return rel ? join(dirs.sounds, ...rel.split('/')) : null; }
+  for (const d of ['editor/src', 'assets/added']) {
+    const pre = `kit/video-projects/${slug}/${d}/`;
+    const n = f.startsWith(pre) && safeName(f.slice(pre.length));
+    if (n) return join(root, 'kit', 'video-projects', slug, ...d.split('/'), n);
   }
-  if (!await ffmpeg(args)) { rmSync(tmp, { force: true }); return { error: 'Could not make the new version. Try again, or send it as a note.' }; }
-  renameSync(tmp, join(dirs.outbox, out));
+  return null;
+}
+const SOUND_UPLOAD = new Set(['.mp3', '.wav', '.m4a', '.aac']);
+// The my-sounds list for "Add sound", sorted into music and effects the same way the rest of the app does.
+const soundList = () => listFolder('sounds').filter((f) => f.kind === 'audio').map((f) => {
+  const path = f.folder ? `${f.folder}/${f.name}` : f.name;
+  return { path, name: f.name, duration: probe(join(dirs.sounds, ...path.split('/')), f.mtime).duration || 0, kind: isEffect(f) ? 'sfx' : 'music' };
+});
+const editBusy = (slug) => job?.slug === slug || queue.some((q) => q.slug === slug);
+const editorPrep = new Map(); // slug -> { text } while making clips ready, or { error }
+const rendering = new Set();
+
+function describeSource(full, id, label, kind = 'video') {
+  const m = probe(full, statSafe(full));
+  const audio = streamsOf(full).some((s) => s.codec_type === 'audio');
+  if (!m.duration || (kind === 'sound' ? !audio : !m.width)) return null;
+  return { id, kind, file: repoPath(full), label, duration: m.duration, ...(kind === 'video' ? { width: m.width, height: m.height } : {}), audio };
+}
+// Makes a clip browser-friendly (H.264, SDR, the edit's frame size) as editor/src/<id>.mp4, one clip at a time.
+let prepChain = Promise.resolve();
+function prepSource(slug, full, id, label, W = 1080, H = 1920) {
+  const work = async () => {
+    const dir = join(editorDir(slug), 'src');
+    mkdirSync(dir, { recursive: true });
+    const out = join(dir, `${id}.mp4`);
+    if (!existsSync(out)) {
+      const tmp = join(dir, `.${id}-${randomUUID()}.mp4`);
+      // prep.sh tone-maps iPhone HDR (a plain convert looks grey), but it only makes 1080x1920 and needs a sound track.
+      const prepped = process.platform === 'darwin' && W === 1080 && H === 1920 && await run('bash', [join(root, 'tools', 'bgswap', 'prep.sh'), full, tmp]);
+      if (!prepped && !await ffmpeg(['-i', full, '-map', '0:v:0', '-map', '0:a:0?',
+        '-vf', `scale=${W}:${H}:force_original_aspect_ratio=decrease,pad=${W}:${H}:(ow-iw)/2:(oh-ih)/2,fps=30,format=yuv420p`,
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '18', '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-movflags', '+faststart', '-f', 'mp4', tmp])) {
+        rmSync(tmp, { force: true });
+        return null;
+      }
+      renameSync(tmp, out);
+    }
+    return describeSource(out, id, label);
+  };
+  const p = prepChain.then(work, work);
+  prepChain = p.catch(() => {});
+  return p;
+}
+const freshEdit = (from, sources) => ({
+  from, sources, parts: sources.map((s) => ({ src: s.id, in: 0, out: s.duration, zoom: 1, x: 0.5, y: 0.5, volume: 1 })), marks: [], audio: [],
+  width: sources[0].width, height: sources[0].height,
+});
+// A new "adjust it myself first" video: make its clips ready, then start the edit list with each clip whole, in order.
+async function prepManual(slug) {
+  const list = loadProject(slug)?.sources || [];
+  const sources = [];
+  for (const [i, n] of list.entries()) {
+    editorPrep.set(slug, { text: list.length > 1 ? `Getting your clips ready (${i + 1} of ${list.length})…` : 'Getting your clip ready…' });
+    pushState();
+    let s = null;
+    try {
+      s = n.startsWith('outbox/') ? describeSource(join(dirs.outbox, n.slice(7)), `s${i + 1}`, n.slice(7))
+        : await prepSource(slug, inboxFull(n), `s${i + 1}`, basename(n));
+    } catch (err) { console.error(err); }
+    if (!s) { editorPrep.set(slug, { error: `Could not get ${basename(n)} ready. Check it is still there and plays, then open the editor again.` }); pushState(); return; }
+    sources.push(s);
+  }
+  if (sources.length) saveEdit(slug, freshEdit(null, sources));
+  editorPrep.delete(slug);
+  pushState();
+}
+// What the editor screen needs. Source and filmstrip URLs carry the file time so a restarted edit never shows old pictures.
+function editorView(slug, rec) {
+  const e = loadEdit(slug);
+  if (existsSync(fixFile(slug)) && !fixing(slug)) rmSync(fixFile(slug), { force: true });
+  const fix = fixing(slug) && !editorPrep.get(slug) ? readJson(fixFile(slug), null) : null;
+  const prep = fix ? { text: `The AI is fixing ${clock(fix.start)} to ${clock(fix.end)}. The editor opens again with the fixed part in place.` } : editorPrep.get(slug);
+  if (!e && rec?.pendingEdit && !prep && rec.sources?.length) prepManual(slug);
+  if (prep?.error) editorPrep.delete(slug); // shown once; the next look tries again
+  // Edit lists from before sound editing have no volume or sound clips.
+  if (fix || fixing(slug)) return { ready: false, fixing: true, preparing: prep?.text || 'Putting the fixed part back…', error: null };
+  return { ready: Boolean(e), preparing: prep?.text || null, error: prep?.error || null, from: e?.from || null,
+    sources: (e?.sources || []).map((s) => sourceView(slug, s)), parts: (e?.parts || []).map((p) => ({ volume: 1, ...p })), marks: e?.marks || [],
+    audio: e?.audio || [], width: e?.width || 1080, height: e?.height || 1920, canAuto: rec?.pendingEdit ? 'pending' : 'form', sounds: soundList() };
+}
+function sourceView(slug, s) {
+  const full = sourceFull(slug, s.file);
+  const v = Math.round(statSafe(full));
+  const base = `/editorfile/${slug}`;
+  const kind = s.kind || 'video';
+  return { id: s.id, kind, label: s.label, duration: s.duration, width: s.width, height: s.height,
+    url: s.file.startsWith('outbox/') ? `/media/${s.file}?v=${v}` : kind === 'sound' ? `${base}/sound/${s.id}?v=${v}` : `${base}/src/${basename(full)}?v=${v}`,
+    ...(kind === 'video' ? { strip: `${base}/strips/${s.id}.jpg?v=${v}` } : {}), ...(kind === 'sound' || s.audio ? { wave: `${base}/waves/${s.id}.png?v=${v}` } : {}) };
+}
+// Timeline pictures (filmstrips and waveforms), made once per source and remade if the source changes.
+const imageJobs = new Map();
+function timelineImage(file, full, args) {
+  if (!full) return Promise.resolve(null);
+  if (statSafe(file) > statSafe(full)) return Promise.resolve(file);
+  if (imageJobs.has(file)) return imageJobs.get(file);
+  mkdirSync(dirname(file), { recursive: true });
+  const tmp = `${file}.part${extname(file)}`;
+  const p = ffmpeg([...args, tmp]).then((ok) => {
+    imageJobs.delete(file);
+    if (ok && existsSync(tmp)) { renameSync(tmp, file); return file; }
+    rmSync(tmp, { force: true });
+    return null;
+  });
+  imageJobs.set(file, p);
+  return p;
+}
+// Filmstrip tiles are 96 px tall at the picture's shape, one per second; waveforms use the same px per second.
+const tileWidth = (w, h) => Math.max(2, Math.round((96 * w) / h / 2) * 2);
+// The filmstrip: one frame per second, 96 px tall, in one row.
+function filmstrip(slug, s) {
+  const full = sourceFull(slug, s.file);
+  const tileW = tileWidth(s.width, s.height);
+  // shortcut: past ~65000 px wide (JPEG's limit, about 20 min of vertical video) frames get spread out to fit.
+  const cols = Math.max(1, Math.min(Math.ceil(s.duration), Math.floor(65000 / tileW)));
+  const rate = cols < Math.ceil(s.duration) ? (cols / s.duration).toFixed(5) : '1';
+  return timelineImage(join(editorDir(slug), 'strips', `${s.id}.jpg`), full,
+    ['-hwaccel', 'auto', '-i', full, '-an', '-vf', `fps=${rate},scale=${tileW}:96,tile=${cols}x1`, '-frames:v', '1', '-q:v', '5']);
+}
+// The waveform: 48 px tall, light on transparent. A sound file uses the edit's frame shape for its px per second.
+// Peaks on a square-root scale: the default (average of samples) is near zero, so speech barely showed.
+function waveform(slug, s, e) {
+  const full = sourceFull(slug, s.file);
+  const pps = s.kind === 'sound' ? tileWidth(e.width, e.height) : tileWidth(s.width, s.height);
+  // shortcut: capped at 65000 px wide like the filmstrip; past that the px per second shrinks to fit.
+  const w = Math.max(2, Math.min(65000, Math.round(s.duration * pps)));
+  return timelineImage(join(editorDir(slug), 'waves', `${s.id}.png`), full,
+    ['-i', full, '-filter_complex', `aformat=channel_layouts=mono,showwavespic=s=${w}x48:colors=0xF2F4F8:filter=peak:scale=sqrt`, '-frames:v', '1']);
+}
+// A video clip is made ready first; a sound file is used as it is.
+async function addSource(slug, full, label, kind = 'video') {
+  const e = loadEdit(slug);
+  if (!e) return { error: 'Open a version in the editor first.' };
+  if (editorPrep.get(slug)?.text) return { error: 'Wait until the clips are ready.' };
+  const id = nextSourceId(e);
+  let s;
+  if (kind === 'sound') s = describeSource(full, id, label, 'sound');
+  else {
+    editorPrep.set(slug, { text: `Getting ${label} ready…` });
+    pushState();
+    s = await prepSource(slug, full, id, label, e.width, e.height);
+    editorPrep.delete(slug);
+    pushState();
+  }
+  if (!s) return { error: `Could not get ${label} ready. Is it a ${kind} this computer can play?` };
+  const now = loadEdit(slug);
+  if (!now) return { error: 'The edit was restarted. Add the clip again.' };
+  now.sources.push(s);
+  saveEdit(slug, now);
+  return { ok: true, source: sourceView(slug, s) };
+}
+const nextSourceId = (e) => `s${Math.max(0, ...e.sources.map((s) => Number(s.id.slice(1)) || 0)) + 1}`;
+// The files an edit list plays, and how many sound channels each has, for renderArgs.
+function editInputs(slug, e) {
+  const files = {};
+  const audio = {};
+  const used = new Set([...e.parts.map((p) => p.src), ...(e.audio || []).map((a) => a.src)]);
+  for (const s of e.sources.filter((x) => used.has(x.id))) {
+    const full = sourceFull(slug, s.file);
+    if (!full || !existsSync(full)) return { error: `${s.label} is not there anymore. Reopen the editor.` };
+    files[s.id] = full;
+    audio[s.id] = streamsOf(full).find((x) => x.codec_type === 'audio')?.channels || 0;
+  }
+  return { files, audio };
+}
+// Renders the edit list in one ffmpeg pass as the next version, plus a still per mark with its box drawn.
+// fix: the AI's fixed part was just put back (its own job is over, so the line may hold other work for this video).
+async function renderEdit(slug, fix = null) {
+  const e = loadEdit(slug);
+  if (!e?.parts?.length) return { error: 'Add at least one part first.' };
+  if (!fix && (editBusy(slug) || fixing(slug))) return { error: 'The editor is working on this video. Try again when it has finished.' };
+  if (rendering.has(slug)) return { error: 'This video is already being saved.' };
+  const inputs = editInputs(slug, e);
+  if (inputs.error) return inputs;
+  const { files, audio } = inputs;
+  const horizontal = Boolean(e.from?.match(VERSION_RE)?.[2].toLowerCase().startsWith('horizontal'));
+  const out = `${slug}-${horizontal ? 'horizontal-' : ''}v${nextVersion(slug, horizontal)}.mp4`;
+  const outFull = join(dirs.outbox, out);
+  const tmp = join(dirs.outbox, `.editor-${randomUUID()}.mp4`);
+  rendering.add(slug);
+  try {
+    const started = Date.now();
+    if (!await ffmpeg(renderArgs(e, { files, audio, hardware: hasHardwareH264(), out: tmp }))) {
+      rmSync(tmp, { force: true });
+      return { error: 'Could not make the new version. Try again, or send it as a note.' };
+    }
+    renameSync(tmp, outFull);
+    console.log(`Hand edit saved as ${out} in ${((Date.now() - started) / 1000).toFixed(1)} s`);
+    const marksDir = join(editorDir(slug), 'marks');
+    rmSync(marksDir, { recursive: true, force: true });
+    mkdirSync(marksDir, { recursive: true });
+    for (const [i, m] of e.marks.entries()) await ffmpeg(markStillArgs(outFull, m, join(marksDir, `mark-${i + 1}.jpg`)));
+    saveEdit(slug, { ...loadEdit(slug), rendered: out });
+  } finally { rendering.delete(slug); }
   const rec = loadProject(slug) || { slug, history: [], fromTerminal: true };
-  rec.history.push({ role: 'you', text: said, at: Date.now() },
-    { role: 'editor', text: `Done on this computer, no AI used. It's saved as ${out.match(VERSION_RE)[2].replace('horizontal-', 'YouTube ')}.`, at: Date.now() });
-  rec.quickEdits = [...(rec.quickEdits || []), line];
+  const saved = `It's saved as ${out.match(VERSION_RE)[2].replace('horizontal-', 'YouTube ')}.`;
+  if (fix) rec.history.push({ role: 'editor', text: `Put the fixed part (${clock(fix.start)} to ${clock(fix.end)}) back in the video. ${saved}`, at: Date.now() });
+  else rec.history.push({ role: 'you', text: 'Changed it by hand in the editor.', at: Date.now() }, { role: 'editor', text: `Done on this computer, no AI used. ${saved}`, at: Date.now() });
+  // "of outbox/<from>" and "saved as outbox/<out>" let deleting a version forget this line (see /api/delete).
+  rec.quickEdits = [...(rec.quickEdits || []), `hand edit${e.from ? ` of outbox/${e.from}` : ''} in the app's editor, parts in order (zoom, position and ` +
+    `cuts are in the picture): ${describeParts(e)}${e.audio?.length ? `; sound clips mixed over it: ${describeSounds(e)}` : ''}, saved as outbox/${out}`];
   rec.updatedAt = Date.now();
   saveProject(rec);
   pushState();
   return { ok: true, file: out };
+}
+
+// ---------- "Fix with AI" on one mark ----------
+// Only the marked stretch goes to the AI: the app cuts it out (editor/fix/piece.mp4), the AI saves editor/fix/fixed.mp4,
+// and the app puts that back in place of the stretch and saves the next version. The edit is locked meanwhile.
+const fixDir = (slug) => join(editorDir(slug), 'fix');
+const fixFile = (slug) => join(fixDir(slug), 'pending.json');
+// A fix left over from a stopped app (no job, nothing being put back) does not lock the edit.
+const fixing = (slug) => existsSync(fixFile(slug)) && (editBusy(slug) || Boolean(editorPrep.get(slug)?.text));
+async function startFix(slug, i) {
+  const e = loadEdit(slug);
+  const m = Number.isInteger(i) ? e?.marks?.[i] : null;
+  if (!m) return { error: 'That mark is not there anymore. Reload the page.' };
+  if (editBusy(slug) || rendering.has(slug) || editorPrep.get(slug)?.text) return { error: 'The editor is working on this video. Try again when it has finished.' };
+  const slice = sliceEdit(e, m.start, m.end);
+  if (!slice.parts.length) return { error: 'That mark is too short. Make it longer than a split second.' };
+  const inputs = editInputs(slug, slice);
+  if (inputs.error) return inputs;
+  const dir = fixDir(slug);
+  rmSync(dir, { recursive: true, force: true });
+  mkdirSync(dir, { recursive: true });
+  const piece = join(dir, 'piece.mp4');
+  rendering.add(slug);
+  try {
+    if (!await ffmpeg(renderArgs(slice, { ...inputs, hardware: hasHardwareH264(), out: piece }))) return { error: 'Could not cut out that part. Try again.' };
+    await ffmpeg(markStillArgs(piece, { ...m, start: 0, end: m.end - m.start }, join(dir, 'still.jpg')));
+  } finally { rendering.delete(slug); }
+  writeJson(fixFile(slug), { mark: i, start: m.start, end: m.end, box: m.box, note: m.note, width: e.width, height: e.height });
+  const req = { type: 'fix', slug };
+  const r = request(req);
+  if (r.error) { rmSync(dir, { recursive: true, force: true }); return r; }
+  noteAsked(slug, `Fix ${clock(m.start)} to ${clock(m.end)} with AI: ${m.note || 'fix what looks wrong in the box'}`, r, req);
+  pushState();
+  return r;
+}
+// After the fix job: put fixed.mp4 back in place of the stretch, drop its mark, and save the next version.
+async function applyFix(slug, failed) {
+  const f = readJson(fixFile(slug), null);
+  if (!f) return;
+  editorPrep.set(slug, { text: 'Putting the fixed part back…' }); // set before any wait, so the edit stays locked
+  pushState();
+  const fixed = join(fixDir(slug), 'fixed.mp4');
+  let problem = null;
+  try {
+    if (failed) problem = 'skip';
+    else if (!existsSync(fixed)) problem = 'The AI did not save a fixed part, so the video was not changed. Read its reply above.';
+    else {
+      const e = loadEdit(slug);
+      const id = nextSourceId(e);
+      const s = await prepSource(slug, fixed, id, `Fixed ${clock(f.start)}–${clock(f.end)}`, e.width, e.height);
+      if (!s) problem = 'The fixed part could not be read, so the video was not changed.';
+      else {
+        const now = loadEdit(slug);
+        now.sources.push(s);
+        now.parts = spliceParts(now.parts, f.start, f.end, { src: id, in: 0, out: Math.min(s.duration, f.end - f.start), zoom: 1, x: 0.5, y: 0.5, volume: 1 });
+        now.marks = now.marks.filter((_, k) => k !== f.mark);
+        saveEdit(slug, now);
+      }
+    }
+  } catch (err) { console.error(err); problem = 'Something went wrong putting the fixed part back, so the video was not changed.'; }
+  finally { rmSync(fixFile(slug), { force: true }); editorPrep.delete(slug); }
+  const r = problem ? { error: problem } : await renderEdit(slug, f);
+  if (r.error && problem !== 'skip') {
+    const rec = loadProject(slug) || { slug, history: [] };
+    rec.history.push({ role: 'editor', text: r.error, error: true, at: Date.now() });
+    rec.updatedAt = Date.now();
+    saveProject(rec);
+  }
+  pushState();
 }
 
 function newSlug(fileName) {
@@ -890,6 +1128,108 @@ function newSlug(fileName) {
   let slug = base;
   for (let i = 2; existsSync(projectFile(slug)) || versionsBySlug().has(slug); i++) slug = `${base}-${i}`;
   return slug;
+}
+
+// ---------- the new-video options and the AI's first prompt ----------
+// One builder for the normal path, "adjust it myself first" (when Auto edit is pressed) and Auto edit from a version.
+
+const OPTION_KEYS = ['files', 'keepOrder', 'name', 'broll', 'extra', 'instructions', 'contact', 'style', 'music', 'sfx', 'assets', 'preview', 'clean'];
+const pickOptions = (b) => Object.fromEntries(OPTION_KEYS.filter((k) => k in b).map((k) => [k, b[k]]));
+
+// Checks the form's options. Clips are inbox paths, or outbox versions written as "outbox/<file>".
+function editOptions({ files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null, style = '', music = '', sfx = true, assets = [], preview = false, clean = false }) {
+  const inInbox = (list) => [...new Set((Array.isArray(list) ? list : []).map(safePath))].filter((n) => n && existsSync(inboxFull(n)));
+  const inOutbox = (n) => { const f = safeName(String(n).slice(7)); return String(n).startsWith('outbox/') && f && VERSION_RE.test(f) && existsSync(join(dirs.outbox, f)) ? `outbox/${f}` : null; };
+  const list0 = Array.isArray(files) ? files : [];
+  const clips = [...new Set(list0.map((n) => inOutbox(n) || inInbox([n])[0]).filter((n) => n && kindOf(n) === 'video'))];
+  if (!clips.length) return { error: 'Those clips are not in your inbox anymore.' };
+  const where = (n) => (n.startsWith('outbox/') ? n : `inbox/${n}`);
+  const title = String(videoName).trim().slice(0, 80) || basename(clips[0]).replace(/\.[^.]+$/, '');
+  const choice = contact?.type === 'person' && readPeople().some((x) => x.id === contact.id) ? { type: 'person', id: contact.id } : { type: 'all' };
+  const learned = findStyle(style);
+  const styleUse = learned?.ready && clean !== true ? learned : null;
+  const brollNames = inInbox(broll).filter((n) => !clips.includes(n));
+  const extraNames = inInbox(extra);
+  const list = (ns) => ns.map(where).join(', ');
+  // Brand pictures and sounds the user attached, each with an optional "what it's for" note.
+  const soundPath = (rel) => { const p = safePath(rel); return p && existsSync(join(dirs.sounds, ...p.split('/'))) ? `my-sounds/${p}` : null; };
+  const assetLines = (Array.isArray(assets) ? assets : []).map((a) => {
+    const ref = String(a?.ref || '');
+    const note = String(a?.note || '').trim().slice(0, 200);
+    let path = null;
+    if (ref.startsWith('image:')) { const n = safeName(ref.slice(6)); if (n && kindOf(n) === 'image' && existsSync(join(imagesDir, n))) path = `my-brand/images/${n}`; }
+    else if (ref.startsWith('sound:')) path = soundPath(ref.slice(6));
+    return path ? `- ${path}${note ? ` — for: ${note}` : ''}` : null;
+  }).filter(Boolean);
+  // Background music: '' = editor decides (default), 'none' = no music, 'track:<path>' = use that track.
+  let musicLine = '';
+  const mus = String(music || '');
+  if (mus === 'none') musicLine = 'Do not add any background music to this video. Keep the voice (and any sound effects) only.';
+  else if (mus.startsWith('track:')) { const p = soundPath(mus.slice(6)); if (p) musicLine = `Use ${p} as the background music bed for this video, kept quiet under the voice.`; }
+  const sfxLine = sfx === false
+    ? 'Do not add any sound effects to this video.'
+    : 'Add sound effects so the video feels lively, even if the style says voice only: a whoosh, pop, ding or similar on cuts, ' +
+      'transitions, text cards, stickers and graphics, always quieter than the voice. Use effects from my-sounds/sfx/ (named by kind, like whoosh-2.wav) and any other sound in my-sounds/ under 15 seconds, when there are any; ' +
+      'otherwise make simple ones with FFmpeg.';
+  const multi = clips.length > 1 && (keepOrder
+    ? `These ${clips.length} clips are parts of one video. Keep them in exactly this order, and drop retakes and false starts inside them.`
+    : `These ${clips.length} clips are parts of one video, filmed as separate takes. Listen to all of them, put them in story order, and drop retakes and false starts. Copy each into assets/raw/ and keep the originals untouched.`);
+  const notes = String(instructions).trim() ? `Notes from me for this video: ${String(instructions).trim()}` : '';
+  return {
+    clips, title, slugFrom: String(videoName).trim() || basename(clips[0]), choice, styleUse, brollNames, clean: clean === true,
+    preview: preview === true && clean !== true, said: String(instructions).trim(),
+    // Clean raw: cuts and voice cleanup only, so none of the look, sound or contact choices apply.
+    lines: (slug, out) => (clean === true ? [
+      `edit this: ${list(clips)}`, multi,
+      `Clean raw edit: follow "Clean raw edit" in CLAUDE.md. Use the slug "${slug}" exactly, and save the first draft as ${out}.`,
+      notes,
+    ] : [
+      `edit this: ${list(clips)}`,
+      multi,
+      preview === true
+        ? `Use the slug "${slug}" exactly. Preview first: follow "Preview first" in CLAUDE.md. Save the 5-second sample as outbox/${slug}-preview.mp4 ` +
+          `and the storyboard frames as outbox/${slug}-preview-01.jpg, -02.jpg, and so on. Do not render the full draft until I say it looks good.`
+        : `Use the slug "${slug}" exactly, and save the first draft as ${out}.`,
+      brollNames.length ? `These inbox clips are B-roll for this video: ${list(brollNames)}.` : '',
+      extraNames.length ? `Also use these inbox files: ${list(extraNames)}.` : '',
+      assetLines.length ? `Use these brand assets in this video, each for the purpose noted:\n${assetLines.join('\n')}` : '',
+      musicLine,
+      sfxLine,
+      contactPrompt(choice),
+      styleUse ? stylePrompt(styleUse.id) : '',
+      notes,
+    ]),
+  };
+}
+
+const projectRecord = (slug, o, status) => ({
+  slug, title: o.title, source: o.clips[0], sources: o.clips, broll: o.brollNames, contact: o.choice, contactLabel: o.clean ? null : contactLabel(o.choice),
+  clean: o.clean, style: o.styleUse?.id || null, styleName: o.styleUse?.name || null, createdAt: Date.now(), updatedAt: Date.now(),
+  status, sessionId: null, history: [], previewFirst: o.preview,
+});
+// Queues the first edit of a project. hand: { from: <slug of the edit>, marks } when the source was adjusted in the editor.
+function queueEdit(slug, o, hand = null) {
+  const out = `outbox/${slug}-v${nextVersion(slug)}.mp4`;
+  const lines = o.lines(slug, out);
+  if (hand) {
+    lines.push('This video was adjusted by hand in the app\'s editor (cuts, zoom, position, added clips, sound). Treat it as one clip and keep those ' +
+      'choices; do not undo the zoom, put cut parts back, or undo sound that was muted, turned up or down, or added.');
+    // An editor folder in the project means new-video refuses the slug, so say how to get past that.
+    if (hand.from === slug && !o.clean && !existsSync(join(root, 'kit', 'video-projects', slug, 'meta.json'))) {
+      lines.push(`kit/video-projects/${slug}/ already exists only because the app's editor keeps its files in editor/ there. Move editor/ out, ` +
+        'run new-video, then move editor/ back in.');
+    }
+    if (hand.sounds) lines.push(`Sound clips I laid over it by hand (times on ${o.clips[0]}): ${hand.sounds}.`);
+    if (hand.marks.length) {
+      lines.push(`I marked spots to fix (follow "Marks and hand-adjusted videos" in CLAUDE.md). Times are on ${o.clips[0]}, boxes are % of the frame, ` +
+        'and each still shows the box in red:', ...describeMarks(hand.marks, (n) => `kit/video-projects/${hand.from}/editor/marks/mark-${n}.jpg`));
+    }
+  }
+  const reqObj = { id: randomUUID(), type: 'edit', slug, title: o.title, prompt: lines.filter(Boolean).join('\n'), styleId: o.styleUse?.id || null };
+  const r = request(reqObj);
+  if (!r.error) noteAsked(slug, o.said || (hand ? 'Auto edit this video.' : o.clips.length > 1 ? `Make one video from these ${o.clips.length} clips.` : 'Edit this video.'), r, reqObj);
+  pushState();
+  return r;
 }
 
 // ---------- the editing job (one at a time) ----------
@@ -1009,7 +1349,7 @@ function startJob({ kind, slug = null, styleId = null, title, prompt, resume = n
     : spawn('claude', args, { cwd: root, detached: true });
   const versionsBefore = slug ? (versionsBySlug().get(slug) || []).map((v) => `${v.file}:${v.mtime}`).join() : '';
   job = { id: randomUUID(), kind, slug, styleId, title, steps: [], todos: [], startedAt: Date.now(), proc, sessionId: resume, rulesBefore, versionsBefore };
-  addStep({ go: 'Building the full edit', edit: 'Getting your clips ready', style: 'Updating your style', learn: 'Watching your sample video', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version', bgcheck: 'Looking at your background photo' }[kind] || 'Reading your notes');
+  addStep({ go: 'Building the full edit', edit: 'Getting your clips ready', style: 'Updating your style', learn: 'Watching your sample video', setup: 'Checking this computer', final: 'Getting the final ready', horizontal: 'Planning the YouTube version', bgcheck: 'Looking at your background photo', fix: 'Looking at the part to fix' }[kind] || 'Reading your notes');
   proc.stdin.end(prompt);
 
   let buf = '';
@@ -1050,10 +1390,11 @@ function finishJob(code, errText) {
     p.sessionId = j.sessionId || p.sessionId;
     p.history.push({ role: 'editor', text, error, stopped: Boolean(j.stopping), at: Date.now(), steps: j.steps.length });
     p.status = error ? 'error' : 'ready';
-    if (!error && newVersion && ['notes', 'final', 'horizontal', 'go'].includes(j.kind)) delete p.quickEdits;
+    if (!error && newVersion && ['edit', 'notes', 'final', 'horizontal', 'go'].includes(j.kind)) delete p.quickEdits;
     p.updatedAt = Date.now();
     saveProject(p);
   }
+  if (j.kind === 'fix') applyFix(j.slug, error || j.stopping);
   if (j.kind === 'style') writeJson(join(data, 'style-reply.json'), { text, error, at: Date.now(), styleId: j.styleId || null });
   if (j.kind === 'learn' && j.styleId) {
     const f = join(styleDir(j.styleId), 'meta.json');
@@ -1127,6 +1468,16 @@ function buildJob(req) {
     if (!src || !photo) return null;
     return { ...base, resume: null, prompt: `Background check for ${req.slug}: follow "Background check" in CLAUDE.md. The clean video is ` +
       `outbox/${src.name}. The photo is kit/video-projects/${req.slug}/bgswap/${photo}. Work in kit/video-projects/${req.slug}/bgswap/.` };
+  }
+  if (req.type === 'fix') {
+    const f = readJson(fixFile(req.slug), null);
+    if (!f) return null;
+    const d = `kit/video-projects/${req.slug}/editor/fix`;
+    const pc = (v) => `${Math.round(v * 100)}%`;
+    return { ...base, resume: null, prompt: `Fix one part of a video: follow "Fixing one part" in CLAUDE.md. The piece is ${d}/piece.mp4 ` +
+      `(${(f.end - f.start).toFixed(2)} s, ${f.width}x${f.height}, 30 fps), cut from ${clock(f.start)} to ${clock(f.end)} of ${req.slug}. ` +
+      `The spot is a box ${pc(f.box.x)} from the left, ${pc(f.box.y)} from the top, ${pc(f.box.w)} wide and ${pc(f.box.h)} tall, drawn in red on ${d}/still.jpg. ` +
+      `What to do: ${f.note || 'fix whatever looks wrong in the box'}. Save the result as ${d}/fixed.mp4.` };
   }
   if (req.type === 'setup') {
     return { ...base, title: 'Setup', prompt: [
@@ -1658,73 +2009,16 @@ const server = createServer(async (req, res) => {
 
     // One video from one or more clips. Several clips are parts (and retakes) of the same talk.
     if (path === '/api/edit' && req.method === 'POST') {
-      const { files = [], keepOrder = false, name: videoName = '', broll = [], extra = [], instructions = '', contact = null, style = '', music = '', sfx = true, assets = [], preview = false, clean = false } = await body(req);
-      const inInbox = (list) => [...new Set((Array.isArray(list) ? list : []).map(safePath))].filter((n) => n && existsSync(inboxFull(n)));
-      const clips = inInbox(files).filter((n) => kindOf(n) === 'video');
-      if (!clips.length) return send(res, 400, { error: 'Those clips are not in your inbox anymore.' });
-      const title = String(videoName).trim().slice(0, 80) || basename(clips[0]).replace(/\.[^.]+$/, '');
-      const slug = newSlug(String(videoName).trim() || basename(clips[0]));
-      const choice = contact?.type === 'person' && readPeople().some((x) => x.id === contact.id) ? { type: 'person', id: contact.id } : { type: 'all' };
-      const learned = findStyle(style);
-      const styleUse = learned?.ready && clean !== true ? learned : null;
-      const brollNames = inInbox(broll).filter((n) => !clips.includes(n));
-      const extraNames = inInbox(extra);
-      const list = (ns) => ns.map((n) => `inbox/${n}`).join(', ');
-      // Brand pictures and sounds the user attached, each with an optional "what it's for" note.
-      const soundPath = (rel) => { const p = safePath(rel); return p && existsSync(join(dirs.sounds, ...p.split('/'))) ? `my-sounds/${p}` : null; };
-      const assetLines = (Array.isArray(assets) ? assets : []).map((a) => {
-        const ref = String(a?.ref || '');
-        const note = String(a?.note || '').trim().slice(0, 200);
-        let path = null;
-        if (ref.startsWith('image:')) { const n = safeName(ref.slice(6)); if (n && kindOf(n) === 'image' && existsSync(join(imagesDir, n))) path = `my-brand/images/${n}`; }
-        else if (ref.startsWith('sound:')) path = soundPath(ref.slice(6));
-        return path ? `- ${path}${note ? ` — for: ${note}` : ''}` : null;
-      }).filter(Boolean);
-      // Background music: '' = editor decides (default), 'none' = no music, 'track:<path>' = use that track.
-      let musicLine = '';
-      const mus = String(music || '');
-      if (mus === 'none') musicLine = 'Do not add any background music to this video. Keep the voice (and any sound effects) only.';
-      else if (mus.startsWith('track:')) { const p = soundPath(mus.slice(6)); if (p) musicLine = `Use ${p} as the background music bed for this video, kept quiet under the voice.`; }
-      const sfxLine = sfx === false
-        ? 'Do not add any sound effects to this video.'
-        : 'Add sound effects so the video feels lively, even if the style says voice only: a whoosh, pop, ding or similar on cuts, ' +
-          'transitions, text cards, stickers and graphics, always quieter than the voice. Use effects from my-sounds/sfx/ (named by kind, like whoosh-2.wav) and any other sound in my-sounds/ under 15 seconds, when there are any; ' +
-          'otherwise make simple ones with FFmpeg.';
-      const multi = clips.length > 1 && (keepOrder
-          ? `These ${clips.length} clips are parts of one video. Keep them in exactly this order, and drop retakes and false starts inside them.`
-          : `These ${clips.length} clips are parts of one video, filmed as separate takes. Listen to all of them, put them in story order, and drop retakes and false starts. Copy each into assets/raw/ and keep the originals untouched.`);
-      const notes = String(instructions).trim() ? `Notes from me for this video: ${String(instructions).trim()}` : '';
-      // Clean raw: cuts and voice cleanup only, so none of the look, sound or contact choices apply.
-      const prompt = (clean === true ? [
-        `edit this: ${list(clips)}`, multi,
-        `Clean raw edit: follow "Clean raw edit" in CLAUDE.md. Use the slug "${slug}" exactly, and save the first draft as outbox/${slug}-v1.mp4.`,
-        notes,
-      ] : [
-        `edit this: ${list(clips)}`,
-        multi,
-        preview === true
-          ? `Use the slug "${slug}" exactly. Preview first: follow "Preview first" in CLAUDE.md. Save the 5-second sample as outbox/${slug}-preview.mp4 ` +
-            `and the storyboard frames as outbox/${slug}-preview-01.jpg, -02.jpg, and so on. Do not render the full draft until I say it looks good.`
-          : `Use the slug "${slug}" exactly, and save the first draft as outbox/${slug}-v1.mp4.`,
-        brollNames.length ? `These inbox clips are B-roll for this video: ${list(brollNames)}.` : '',
-        extraNames.length ? `Also use these inbox files: ${list(extraNames)}.` : '',
-        assetLines.length ? `Use these brand assets in this video, each for the purpose noted:\n${assetLines.join('\n')}` : '',
-        musicLine,
-        sfxLine,
-        contactPrompt(choice),
-        styleUse ? stylePrompt(styleUse.id) : '',
-        notes,
-      ]).filter(Boolean).join('\n');
-      const reqObj = { id: randomUUID(), type: 'edit', slug, title, prompt, styleId: styleUse?.id || null };
-      saveProject({
-        slug, title, source: clips[0], sources: clips, broll: brollNames, contact: choice, contactLabel: clean === true ? null : contactLabel(choice), clean: clean === true,
-        style: styleUse?.id || null, styleName: styleUse?.name || null, createdAt: Date.now(), updatedAt: Date.now(),
-        status: 'queued', sessionId: null, history: [], previewFirst: preview === true && clean !== true,
-      });
-      const r = request(reqObj);
+      const b = await body(req);
+      const o = editOptions(b);
+      if (o.error) return send(res, 400, o);
+      const slug = newSlug(o.slugFrom);
+      const manual = b.manual === true;
+      // Adjust it myself first: the AI waits; these options are used when the user presses Auto edit.
+      saveProject({ ...projectRecord(slug, o, manual ? 'manual' : 'queued'), ...(manual ? { pendingEdit: pickOptions(b), previewFirst: false } : {}) });
+      if (manual) { prepManual(slug); pushState(); return send(res, 200, { ok: true, slug }); }
+      const r = queueEdit(slug, o);
       if (r.error) { rmSync(projectFile(slug), { force: true }); return send(res, 409, r); }
-      noteAsked(slug, String(instructions).trim() || (clips.length > 1 ? `Make one video from these ${clips.length} clips.` : 'Edit this video.'), r, reqObj);
-      pushState();
       return send(res, 200, { ok: true, slug, queued: Boolean(r.queued) });
     }
 
@@ -1769,23 +2063,106 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { ok: true, queued: Boolean(r.queued) });
     }
 
-    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/cut$/)) && req.method === 'POST') {
-      const { from, start, end } = await body(req);
-      const r = await quickEdit(m[1], safeName(from || ''), { cut: [start, end] });
-      return send(res, r.error ? 409 : 200, r);
+    // ---------- the hand editor ----------
+    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/editor(?:\/(open|source|render|auto|fix))?$/))) {
+      const [, slug, action = ''] = m;
+      const rec = loadProject(slug);
+      if (!rec && !versionsBySlug().has(slug)) return send(res, 404, { error: 'Project not found.' });
+      const version = (name) => { const n = safeName(name || ''); return n && n.match(VERSION_RE)?.[1] === slug && existsSync(join(dirs.outbox, n)) ? n : null; };
+      if (!action && req.method === 'GET') return send(res, 200, editorView(slug, rec));
+      if (action !== 'auto' && fixing(slug)) return send(res, 409, { error: 'The AI is fixing a part of this video. Wait until it is back.' });
+      if (!action && req.method === 'PUT') {
+        const e = loadEdit(slug);
+        if (!e) return send(res, 404, { error: 'Open a version in the editor first.' });
+        const r = cleanEdit(e, await body(req));
+        if (r.error) return send(res, 400, r);
+        saveEdit(slug, { ...loadEdit(slug), parts: r.parts, marks: r.marks, audio: r.audio });
+        return send(res, 200, { ok: true });
+      }
+      if (action === 'open' && req.method === 'POST') {
+        const from = version((await body(req)).from);
+        if (!from) return send(res, 400, { error: 'That version is not here anymore.' });
+        if (editorPrep.get(slug)?.text || rendering.has(slug)) return send(res, 409, { error: 'Wait until the editor has finished getting clips ready or saving.' });
+        const s = describeSource(join(dirs.outbox, from), 's1', from);
+        if (!s) return send(res, 400, { error: 'Could not read that video.' });
+        for (const d of ['src', 'strips', 'waves', 'marks']) rmSync(join(editorDir(slug), d), { recursive: true, force: true });
+        saveEdit(slug, freshEdit(from, [s]));
+        return send(res, 200, editorView(slug, rec));
+      }
+      // A clip or sound for the edit: uploaded (the body is the file, kept in assets/added/), from the inbox or from my-sounds/.
+      if (action === 'source' && req.method === 'PUT') {
+        const name = safeName(url.searchParams.get('name')?.replace(/[\\/:*?"<>|]/g, '_'));
+        const kind = name && (kindOf(name) === 'video' ? 'video' : SOUND_UPLOAD.has(extname(name).toLowerCase()) ? 'sound' : null);
+        if (!kind) return send(res, 400, { error: 'That needs to be a video, or a sound file (MP3, WAV, M4A or AAC).' });
+        if (!loadEdit(slug)) return send(res, 404, { error: 'Open a version in the editor first.' });
+        const dir = join(root, 'kit', 'video-projects', slug, 'assets', 'added');
+        mkdirSync(dir, { recursive: true });
+        const clip = join(dir, freeName(dir, name));
+        try { await pipeline(req, createWriteStream(clip)); } catch { rmSync(clip, { force: true }); return send(res, 500, { error: 'Could not save the clip. Is the disk full?' }); }
+        const r = await addSource(slug, clip, name, kind);
+        if (r.error) rmSync(clip, { force: true });
+        return send(res, r.error ? 409 : 200, r);
+      }
+      if (action === 'source' && req.method === 'POST') {
+        const b = await body(req);
+        let r;
+        if (b.sound !== undefined) {
+          const rel = safePath(b.sound);
+          if (!rel || kindOf(rel) !== 'audio' || !existsSync(join(dirs.sounds, ...rel.split('/')))) return send(res, 400, { error: 'That sound is not in My sounds anymore.' });
+          r = await addSource(slug, join(dirs.sounds, ...rel.split('/')), basename(rel), 'sound');
+        } else {
+          const rel = safePath(b.inbox);
+          if (!rel || kindOf(rel) !== 'video' || !existsSync(inboxFull(rel))) return send(res, 400, { error: 'That clip is not in your inbox anymore.' });
+          r = await addSource(slug, inboxFull(rel), basename(rel));
+        }
+        return send(res, r.error ? 409 : 200, r);
+      }
+      if (action === 'fix' && req.method === 'POST') {
+        const r = await startFix(slug, (await body(req)).mark);
+        return send(res, r.error ? 409 : 200, r);
+      }
+      if (action === 'render' && req.method === 'POST') {
+        const r = await renderEdit(slug);
+        return send(res, r.error ? 409 : 200, r);
+      }
+      if (action === 'auto' && req.method === 'POST') {
+        const b = await body(req);
+        const file = version(b.file);
+        if (!file) return send(res, 400, { error: 'That version is not here anymore.' });
+        const e = loadEdit(slug);
+        const hand = e?.rendered === file ? { from: slug, marks: e.marks, sounds: describeSounds(e) } : null;
+        if (rec?.pendingEdit) {
+          const o = editOptions({ ...rec.pendingEdit, files: [`outbox/${file}`], preview: false });
+          if (o.error) return send(res, 400, o);
+          const r = queueEdit(slug, o, hand);
+          if (r.error) return send(res, 409, r);
+          const now = loadProject(slug);
+          delete now.pendingEdit;
+          saveProject(now);
+          pushState();
+          return send(res, 200, { ok: true, slug, queued: Boolean(r.queued) });
+        }
+        if (!b.options || typeof b.options !== 'object') return send(res, 400, { error: 'Pick how the AI should edit it first.' });
+        const o = editOptions({ ...pickOptions(b.options), files: [`outbox/${file}`], name: String(b.options.name || '').trim() || rec?.title || prettyTitle(slug) });
+        if (o.error) return send(res, 400, o);
+        const next = newSlug(o.slugFrom);
+        saveProject(projectRecord(next, o, 'queued'));
+        const r = queueEdit(next, o, hand);
+        if (r.error) { rmSync(projectFile(next), { force: true }); return send(res, 409, r); }
+        return send(res, 200, { ok: true, slug: next, queued: Boolean(r.queued) });
+      }
+      return send(res, 405, { error: 'Not allowed.' });
     }
-    // The clip arrives as the request body and is kept in the project, where the AI can find it later.
-    if ((m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/insert$/)) && req.method === 'PUT') {
-      const name = safeName(url.searchParams.get('name')?.replace(/[\\/:*?"<>|]/g, '_'));
-      if (!name || kindOf(name) !== 'video') return send(res, 400, { error: 'That needs to be a video file.' });
-      if (!versionsBySlug().has(m[1])) return send(res, 404, { error: 'Project not found.' });
-      const dir = join(root, 'kit', 'video-projects', m[1], 'assets', 'added');
-      mkdirSync(dir, { recursive: true });
-      const clip = join(dir, freeName(dir, name));
-      try { await pipeline(req, createWriteStream(clip)); } catch { rmSync(clip, { force: true }); return send(res, 500, { error: 'Could not save the clip. Is the disk full?' }); }
-      const r = await quickEdit(m[1], safeName(url.searchParams.get('from') || ''), { at: url.searchParams.get('at'), clip });
-      if (r.error) rmSync(clip, { force: true });
-      return send(res, r.error ? 409 : 200, r);
+    // Editor files: prepared clips, sound files, filmstrips and waveforms (made on first ask) and mark stills.
+    if ((m = path.match(/^\/editorfile\/([a-z0-9-]+)\/(?:src\/(s\d+\.mp4)|marks\/(mark-\d+\.jpg)|(strips|waves|sound)\/(s\d+)(?:\.jpg|\.png)?)$/))) {
+      const [, slug, src, mark, what, id] = m;
+      if (src || mark) return serveFile(req, res, join(editorDir(slug), src ? 'src' : 'marks', src || mark));
+      const e = loadEdit(slug);
+      const s = e?.sources.find((x) => x.id === id);
+      const f = !s ? null : what === 'sound' ? (s.kind === 'sound' && sourceFull(slug, s.file))
+        : what === 'waves' ? (s.kind === 'sound' || s.audio) && await waveform(slug, s, e) : s.kind !== 'sound' && await filmstrip(slug, s);
+      if (!f) { res.writeHead(404); return res.end(); }
+      return serveFile(req, res, f);
     }
 
     // ---------- background replacement (clean raw videos) ----------

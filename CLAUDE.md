@@ -236,7 +236,16 @@ them in their clean video. It is free: do not run `higgsfield` or anything that 
    hand gestures, and [pose]. Replace the entire environment, including [what they sit or stand on], with the scene in
    the reference image. [Where and how they sit or stand in the new room, with natural contact shadows.] [Light that
    matches the reference.] Static camera, same framing. Photorealistic, natural phone-camera look."
-6. Final message: the verdict and 2 to 4 short bullets.
+6. When the verdict is not "good", write the angle-matched background prompt. The user pastes it into an image model
+   (Nano Banana Pro on the Higgsfield website, often free on their Unlimited plan); the app's paid button uses it too.
+   Save the video frame at about 2 s, full size, as `camera_frame.jpg` (image 1); the photo is image 2. Write
+   `plate_prompt.txt`: one paragraph that says image 1 shows the camera (position, height, angle, lens, distance) and image 2
+   the room, and asks for a photo of the empty room from image 2 seen from exactly image 1's camera. Then fix each problem
+   from the check in concrete words: where the seat sits and how tall it is in the frame (match the person's seat in
+   image 1), what to remove (desks, tables, cups, people in front of the seat), and light that matches how the person is
+   lit in image 1 (direction, warmth, brightness). Keep the room's walls, furniture and style. End with "No people.
+   Vertical 9:16. Photorealistic, natural phone-camera look." Skip this step when `plate.png` exists.
+7. Final message: the verdict and 2 to 4 short bullets.
 
 ## Preview first
 
@@ -261,6 +270,39 @@ pull 4 to 6 frames from the render (the hook, a caption, each graphic or card, t
 with `my-brand/` and the style: colors and gradients, fonts, the logo, and the contact part's name and numbers.
 Fix what is off and render again, once. Anything you could not fix goes under `## Not done`. A learned style
 that is not branded keeps its own colors and fonts, so check only the logo and contact part there.
+
+## Marks and hand-adjusted videos
+
+The app has a hand editor where the user cuts, zooms, moves the picture and adds clips before (or instead of) you.
+Its edit list is in `kit/video-projects/<slug>/editor/edit.json`.
+
+- A video the request says was adjusted by hand is one clip: keep its cuts, zoom and position. Do not undo the zoom
+  or put cut parts back. Its sound was set by hand too (parts muted or made louder, sound clips laid over it): keep it,
+  and put any music or effects you add on top at a level that still lets it be heard.
+- Marks are spots the user wants fixed: a time range on that video, a box as % of the frame, a note, and a still
+  with the box drawn in red (`editor/marks/mark-<n>.jpg`). Look at each still, then fix what is in the box for that
+  time, the way the note asks: crop or zoom past it, cover it with a graphic or B-roll, blur it, or something else
+  that fits. With no note, fix whatever looks wrong in the box. Anything you could not fix goes under `## Not done`.
+- A note that lists hand edits made since the last render: redo them in the project first so they carry into the
+  next render.
+
+## Fixing one part
+
+When the app asks to fix one part of a video, it has cut out only that stretch (`editor/fix/piece.mp4`) and will put
+your result back in its place and save the next version itself. It is all local and free, so do not stop for approval.
+
+- Look at `still.jpg` (the spot in red) and a few frames of the piece first. Change only what the request asks, inside
+  the box unless it says otherwise. Everything else in the piece stays exactly as it is.
+- Use plain ffmpeg when you can: blur, cover with a brand picture or B-roll from `my-brand/`, crop or zoom past it, color.
+  Make a small HyperFrames project (`npm run new-video -- <slug>-fix` from `kit/`) only for text or graphics; read
+  `my-style.md` (or the project's style), `my-brand/brand.json` and the project's own composition so it matches.
+- Save `fixed.mp4` beside the piece: same length (within one frame), same size, 30 fps, H.264 yuv420p, AAC 48 kHz,
+  with the piece's own sound unless the request is about the sound. No fades at the start or end, since it is joined back hard.
+- Do not save anything in `outbox/` and do not render the whole video. If it cannot be fixed, save nothing and say why.
+- End with one short line on what you did.
+
+From the terminal ("fix 0:12 to 0:15: blur the logo"): do the same yourself on the latest version. Cut the stretch with
+ffmpeg, fix it, join it back (re-encode at the joins so the cut is frame-exact), and save the next `-v<n>.mp4`.
 
 ## Notes become rules
 

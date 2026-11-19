@@ -6,9 +6,10 @@ Compares frame-to-frame motion of the person. A static replaced background adds 
 two signals line up even though the rooms differ.
 Prints offset in ms: positive = generated picture is LATE (trim that much off its start).
 """
-import re, subprocess, sys
+import re, statistics, subprocess, sys
 
 RATE = 100  # samples per second for the comparison
+FACE = (0.38, 0.42, 0.28, 0.22)  # shortcut: assumes a centered talking head (lips drive sync); make it an option if framing varies
 
 
 def motion(path, crop):
@@ -27,6 +28,25 @@ def motion(path, crop):
             j += 1
         out.append(pts[j][1])
     return out
+
+
+def sound(path):
+    """Loudness in dB at RATE per second; [] when the file has no audio."""
+    err = subprocess.run(["ffmpeg", "-hide_banner", "-i", path, "-vn", "-af",
+                          f"aresample=8000,asetnsamples={8000 // RATE},astats=metadata=1:reset=1,"
+                          "ametadata=print:key=lavfi.astats.Overall.RMS_level", "-f", "null", "-"],
+                         capture_output=True, text=True).stderr
+    return [max(-80.0, -120.0 if v == "-inf" else float(v)) for v in re.findall(r"RMS_level=(-?[\d.]+|-inf)", err)]
+
+
+def pick(est, prev, good=0.6, agree=0.2):
+    """est: [(lag, corr)] from independent signals for one part. Median of the strong ones; if none is
+    strong, median of all when they agree within `agree` s; else keep prev. One wrong signal can't win."""
+    strong = [L for L, c in est if c >= good]
+    if strong:
+        return statistics.median(strong)
+    lags = [L for L, _ in est]
+    return statistics.median(lags) if lags and max(lags) - min(lags) <= agree else prev
 
 
 def best_lag(a, b, lo, hi, maxlag=0.6, minlen=1.0):
@@ -61,6 +81,9 @@ if __name__ == "__main__":
         import random
         random.seed(1); a = [random.random() for _ in range(800)]
         assert best_lag(a, [0.0] * 5 + a, 0.5, 7)[0] == 0.05  # b late by 5 samples = +50 ms
+        assert pick([(0.12, 0.69), (-0.94, 0.89), (0.13, 0.85)], 0) == 0.12  # one strong outlier is outvoted
+        assert pick([(0.6, 0.34), (0.5, 0.44), (0.59, 0.4)], 0.1) == 0.59     # all weak but agreeing
+        assert pick([(-1.2, 0.3), (0.6, 0.2)], 0.1) == 0.1                    # weak and scattered: keep previous
         print("selftest ok"); sys.exit()
     crop = tuple(map(float, sys.argv[sys.argv.index("--crop") + 1].split(","))) if "--crop" in sys.argv else (0.2, 0.15, 0.6, 0.7)
     print(measure(sys.argv[1], sys.argv[2], crop))
